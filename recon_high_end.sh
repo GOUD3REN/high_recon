@@ -67,8 +67,22 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.2.0"
-SELF="$(basename "$0")"
+# ── Snapshot: re-executa de uma cópia imutável ───────────────────────────────
+# Assim, editar o script original durante uma run não corrompe a execução.
+if [[ "${BASH_SOURCE[0]}" == "$0" && -z "${RECON_SELFCOPY:-}" ]]; then
+  _self_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  mkdir -p /tmp/opencode 2>/dev/null || true
+  _self_copy="/tmp/opencode/recon-run-$$.sh"
+  if cp -f "$_self_src" "$_self_copy" 2>/dev/null; then
+    chmod 700 "$_self_copy" 2>/dev/null || true
+    export RECON_SELFCOPY="$_self_copy"
+    export RECON_ORIG_NAME="$(basename "$_self_src")"
+    exec bash "$_self_copy" "$@"
+  fi
+fi
+
+VERSION="1.2.1"
+SELF="${RECON_ORIG_NAME:-$(basename "$0")}"
 
 # ── Configuração (sobrescreva por env) ───────────────────────────────────────
 DOCS_ROOT="${DOCS_ROOT:-/home/hack/docs}"
@@ -86,11 +100,17 @@ THREADS="${THREADS:-10}"                 # paralelismo global
 MAX_PERMUTATIONS="${MAX_PERMUTATIONS:-6000}"   # permutações geradas/ resolvidas
 PERM_INPUT="${PERM_INPUT:-1500}"               # hosts de entrada do alterx
 MAX_JS="${MAX_JS:-3000}"                 # teto de arquivos JS baixados
+MAX_JS_EXTRA="${MAX_JS_EXTRA:-800}"      # 2ª rodada: chunks .js descobertos nos bundles
 MAX_ARJUN="${MAX_ARJUN:-15}"             # teto de origins para arjun
+ARJUN_TIMEOUT="${ARJUN_TIMEOUT:-120}"    # timeout por alvo (arjun pendura fácil)
+ARJUN_PHASE_TIMEOUT="${ARJUN_PHASE_TIMEOUT:-420}"  # teto da fase inteira
+ARJUN_WORDLIST="${ARJUN_WORDLIST:-/home/hack/wordlists/params.txt}"
+ARJUN_FALLBACK="${ARJUN_FALLBACK:-0}"    # 1 = usa crawl_targets se o probe não achar nada
 PORTS_MODE="${PORTS_MODE:-quick}"        # none | quick (top 100) | full (top 1000)
 NAABU_TOP_PORTS="${NAABU_TOP_PORTS:-1000}"     # usado quando PORTS_MODE=full
 NAABU_EXCLUDE="${NAABU_EXCLUDE:-22,23,3389}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-8}"
+UA="${UA:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36}"
 KATANA_DEPTH="${KATANA_DEPTH:-3}"
 KATANA_FS="${KATANA_FS:-fqdn}"
 KATANA_HEADLESS="${KATANA_HEADLESS:-0}"
@@ -102,9 +122,15 @@ KATANA_FSU="${KATANA_FSU:-1}"            # filtra URLs parecidas (IDs numéricos
 KATANA_CHUNK_TIMEOUT="${KATANA_CHUNK_TIMEOUT:-240}"
 KATANA_MAX_URLS_PER_CHUNK="${KATANA_MAX_URLS_PER_CHUNK:-20000}"
 # hosts de conteúdo/estático fora do crawl (economiza horas e ruído)
-CRAWL_EXCLUDE="${CRAWL_EXCLUDE:-cdn|static|img[0-9]*|images|assets|media|files|downloads?|fonts|blog|backend\.blog|www\.blog|building|novidades|estagio|comunidade|community|help|suporte|ajuda|careers|carreiras|newsroom|imprensa|status|trust|privacidade|legal|termos}"
+CRAWL_EXCLUDE="${CRAWL_EXCLUDE:-cdn|static|img[0-9]*|images|assets|media|files|downloads?|fonts|blog|backend\.blog|www\.blog|building|novidades|estagio|comunidad|comunidade|community|foro|forum|discourse|help|suporte|ajuda|careers|carreiras|newsroom|imprensa|status|trust|privacidade|legal|termos}"
 # wayback está bloqueado nesta rede; commoncrawl/urlscan funcionam
 GAU_PROVIDERS="${GAU_PROVIDERS:-commoncrawl,urlscan}"
+GAU_FORCE="${GAU_FORCE:-0}"               # 1 = roda gau mesmo com commoncrawl bloqueado
+URLSCAN_PAGES="${URLSCAN_PAGES:-3}"       # páginas do fallback urlscan (100/página)
+HISTORY_PROXY_ENV="${HISTORY_PROXY-}"
+HISTORY_PROXY="${HISTORY_PROXY:-auto}"    # auto (detecta Tor 9050/9150) | off | socks5h://host:porta
+CDX_LIMIT="${CDX_LIMIT:-20000}"           # teto de URLs do CDX
+SCOPE_ENDPOINTS="${SCOPE_ENDPOINTS:-1}"   # 1 = mantém só URLs do domínio alvo
 HISTORY_PER_HOST="${HISTORY_PER_HOST:-0}" # 1 = um processo por host (lento)
 SKIP_CHAOS="${SKIP_CHAOS:-0}"
 SUBFINDER_ALL="${SUBFINDER_ALL:-0}"
@@ -188,6 +214,8 @@ ENV
   PORTS_MODE KATANA_CHUNK KATANA_MAX_HOSTS KATANA_DEPTH KATANA_JSLUICE
   KATANA_AFF KATANA_FSU KATANA_CHUNK_TIMEOUT KATANA_MAX_URLS_PER_CHUNK
   HISTORY_PER_HOST MAX_JS MAX_ARJUN CRAWL_EXCLUDE GAU_PROVIDERS
+  ARJUN_TIMEOUT ARJUN_PHASE_TIMEOUT ARJUN_WORDLIST
+  HISTORY_PROXY CDX_LIMIT URLSCAN_PAGES GAU_FORCE
 
 EXEMPLO
   ${SELF}                                  # abre o menu
@@ -309,9 +337,19 @@ HV_AWK=""
 cleanup() {
   [[ -n "$AUTH_RC" && -f "$AUTH_RC" ]] && rm -f "$AUTH_RC"
   [[ -n "$HV_AWK" && -f "$HV_AWK" ]] && rm -f "$HV_AWK"
+  [[ -n "${RECON_SELFCOPY:-}" && -f "$RECON_SELFCOPY" ]] && rm -f "$RECON_SELFCOPY"
   return 0
 }
 trap cleanup EXIT
+
+# Ctrl-C / SIGTERM: encerra filhos e libera o lock de forma limpa
+interrupted() {
+  warn "interrompido (Ctrl-C/SIGTERM) — encerrando"
+  trap - INT TERM
+  pkill -TERM -P $$ 2>/dev/null || true
+  exit 130
+}
+trap interrupted INT TERM
 
 load_auth() {
   HDRS=(); HDR_FLAGS=(); HDR_BLOB=""
@@ -353,14 +391,19 @@ load_auth() {
 
 # ── Helpers exportados para xargs -P ─────────────────────────────────────────
 dl_js() {
-  local url="$1" h dest code
+  local url="$1" h dest code origin refargs=()
   h="$(printf '%s' "$url" | md5sum | cut -d' ' -f1)"
   dest="$JS_DIR/${h}.js"
   [[ -s "$dest" ]] && return 0
-  code="$(curl -sk --max-time 30 -K "$AUTH_RC" -o "$dest" -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+  origin="$(printf '%s' "$url" | grep -oE '^https?://[^/]+' || true)"
+  [[ -n "$origin" ]] && refargs=(-e "${origin}/")
+  code="$(curl -skL --compressed --max-time 30 -A "$UA" "${refargs[@]+"${refargs[@]}"}" \
+          -K "$AUTH_RC" -o "$dest" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
   case "$code" in
     2*) printf '%s\t%s\n' "$h" "$url" >> "$JS_MANIFEST" ;;
-    *)  rm -f "$dest" ;;
+    *)  printf '%s\t%s\n' "$code" "$url" >> "$JS_DIR/.failed.tsv"
+        rm -f "$dest" ;;
   esac
 }
 
@@ -394,14 +437,28 @@ js_map_sources() {
 }
 
 arjun_one() {
-  local url="$1" safe
+  local url="$1" safe wl=()
   safe="$(printf '%s' "$url" | sed -E 's#^https?://##; s#[^A-Za-z0-9._-]#_#g' | cut -c1-100)"
   local extra=()
   [[ -n "${HDR_BLOB:-}" ]] && extra=(--headers "$HDR_BLOB")
-  arjun -u "$url" --stable -t 5 -T 10 -q --rate-limit 30 "${extra[@]+"${extra[@]}"}" \
-        -oT "$ARJUN_DIR/${safe}.txt" 2>/dev/null || true
+  [[ -s "${ARJUN_WORDLIST:-}" ]] && wl=(-w "$ARJUN_WORDLIST")
+  timeout "${ARJUN_TIMEOUT:-120}" arjun -u "$url" --stable --disable-redirects \
+        -t 5 -T 8 -q --rate-limit 20 "${wl[@]+"${wl[@]}"}" "${extra[@]+"${extra[@]}"}" \
+        -oT "$ARJUN_DIR/${safe}.txt" >/dev/null 2>&1 || true
 }
 
+# Pré-filtro: só alvo 200 + HTML + resposta rápida (evita CDN/host pendurado)
+arjun_probe_one() {
+  local u="$1" out code t ct
+  out="$(curl -sk -m 4 -A "${UA:-curl}" -o /dev/null \
+        -w '%{http_code} %{time_total} %{content_type}' "$u" 2>/dev/null || true)"
+  read -r code t ct <<< "$out"
+  [[ "$code" == "200" ]] || return 0
+  [[ "$ct" == *html* ]] || return 0
+  awk -v t="$t" 'BEGIN { exit !(t < 3) }' || return 0
+  printf '%s\n' "$u"
+}
+export -f arjun_probe_one
 export -f dl_js js_base_url js_urls js_map_sources arjun_one
 
 # ── Credenciais opcionais (GitHub / Chaos) ───────────────────────────────────
@@ -607,7 +664,7 @@ phase_asset() {
   # Bruteforce DNS (ShuffleDNS)
   : > "$OUT/brute.txt"
   if (( ! SKIP_BRUTE )) && have shuffledns && [[ -s "$DNS_WORDLIST" && -s "$RESOLVERS" ]]; then
-    log "bruteforce DNS: $(basename "$DNS_WORDLIST")"
+    log "bruteforce DNS: $(basename "$DNS_WORDLIST") (pode levar alguns minutos)"
     timeout 2400 shuffledns -d "$d" -w "$DNS_WORDLIST" -r "$RESOLVERS" \
       -mode bruteforce -silent 2>>"$LOG" > "$OUT/brute.txt" || warn "shuffledns falhou"
   elif (( SKIP_BRUTE )); then
@@ -642,12 +699,14 @@ phase_asset() {
   fi
 
   # Resolve tudo que é conhecido (fonte de verdade para portas/HTTP)
-  local subs_tmp="$OUT/.subs_resolved.txt"
+  log "dnsx: resolvendo $(count "$OUT/subdomains_candidates.txt") candidatos + $(count "$OUT/permutations.txt") permutações (pode levar minutos)"
+  local subs_tmp="$OUT/.subs_resolved.txt" subs_raw="$OUT/.dnsx_final.txt"
+  : > "$subs_raw"
   if ! sort -u "$OUT/subdomains_candidates.txt" "$OUT/permutations.txt" 2>/dev/null \
-      | timeout 900 dnsx -silent -t 100 -r "$RESOLVERS" 2>>"$LOG" \
-      | sort -u > "$subs_tmp"; then
+      | timeout 900 dnsx -silent -t 100 -r "$RESOLVERS" -o "$subs_raw" >/dev/null 2>>"$LOG"; then
     warn "resolução final retornou erro (usando saída parcial)"
   fi
+  sort -u "$subs_raw" > "$subs_tmp" 2>/dev/null || true
   if [[ -s "$subs_tmp" ]]; then
     mv -f "$subs_tmp" "$OUT/subdomains.txt"
   else
@@ -716,9 +775,10 @@ phase_ports_http() {
     local tp=100
     [[ "$PORTS_MODE" == "full" ]] && tp="$NAABU_TOP_PORTS"
     log "portas: top-${tp} (mode=${PORTS_MODE}, -ec, excl ${NAABU_EXCLUDE})"
+    : > "$OUT/open_ports_raw.txt"
     timeout 1200 naabu -list "$OUT/subdomains.txt" -top-ports "$tp" \
       -ep "$NAABU_EXCLUDE" -ec -silent -rate 2000 2>>"$LOG" \
-      | sort -u > "$OUT/open_ports.txt" || warn "naabu falhou"
+      | tee "$OUT/open_ports_raw.txt" | sort -u > "$OUT/open_ports.txt" || warn "naabu falhou"
   else
     warn "naabu ausente"
   fi
@@ -786,9 +846,65 @@ phase_ports_http() {
 # =============================================================================
 #  FASE 2 — CONTENT DISCOVERY
 # =============================================================================
+# Wayback CDX via curl (aceita SOCKS/HTTP proxy; waybackurls ignora proxy)
+history_proxy_url() {
+  local p
+  case "${HISTORY_PROXY:-auto}" in
+    ""|off|none|0) return 1 ;;
+    auto)
+      for p in 9050 9150; do
+        if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null; then
+          printf 'socks5h://127.0.0.1:%s' "$p"
+          return 0
+        fi
+      done
+      return 1 ;;
+    *) printf '%s' "$HISTORY_PROXY"; return 0 ;;
+  esac
+}
+
+wayback_cdx() {
+  local d="$1" out="$2" proxy pargs=()
+  proxy="$(history_proxy_url || true)"
+  [[ -n "$proxy" ]] && pargs=(--proxy "$proxy")
+  curl "${pargs[@]+"${pargs[@]}"}" -s -m 600 \
+    "https://web.archive.org/cdx/search/cdx?url=*.${d}&fl=original&collapse=urlkey&limit=${CDX_LIMIT}" \
+    > "$out" 2>>"$LOG" || true
+  if grep -qE '^https?://' "$out" 2>/dev/null; then
+    grep -E '^https?://' "$out" 2>/dev/null \
+      | grep -Eiv 'data:|base64|javascript:|mailto:|%22data|%3Csvg' \
+      | awk 'length($0) < 2000' > "$out.tmp" 2>/dev/null && mv -f "$out.tmp" "$out"
+  else
+    warn "wayback CDX: sem URLs (serviço offline ou bloqueado)"
+    : > "$out"
+  fi
+  return 0
+}
+
+urlscan_history() {  local d="$1" out="$2" pages="${URLSCAN_PAGES:-3}" i=0 json after="" url
+  : > "$out"
+  while (( i < pages )); do
+    i=$((i + 1))
+    if [[ -n "$after" ]]; then
+      url="https://urlscan.io/api/v1/search/?q=domain:${d}&size=100&search_after=${after}"
+    else
+      url="https://urlscan.io/api/v1/search/?q=domain:${d}&size=100"
+    fi
+    json="$(curl -s -m 25 "$url" 2>>"$LOG" || true)"
+    [[ -n "$json" ]] || break
+    printf '%s' "$json" | jq -r '.results[]? | (.page.url // empty), (.task.url // empty)' 2>/dev/null \
+      | grep -Fi "$d" >> "$out" || true
+    after="$(printf '%s' "$json" | jq -r '(.results[-1].sort // empty) | @csv' 2>/dev/null | tr -d '"')"
+    [[ -n "$after" && "$after" != "null" ]] || break
+    sleep 1
+  done
+  sort -u -o "$out" "$out" 2>/dev/null || true
+  return 0
+}
+
 phase_content() {
   local t0=$SECONDS
-  : > "$OUT/urls_katana.txt"; : > "$OUT/urls_wayback.txt"; : > "$OUT/urls_gau.txt"
+  : > "$OUT/urls_katana.txt"; : > "$OUT/urls_wayback.txt"; : > "$OUT/urls_gau.txt"; : > "$OUT/urls_urlscan.txt"
 
   # ── Histórico primeiro (barato e cobre tudo de uma vez) ──────────────────
   if (( SKIP_HISTORY )); then
@@ -809,23 +925,40 @@ phase_content() {
       fi
     else
       # 1 consulta por domínio: cobre subdomínios de uma vez (segundos/minutos)
-      local wb_code
-      wb_code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' https://web.archive.org/ 2>/dev/null || echo 000)"
-      if have waybackurls && [[ "$wb_code" =~ ^[23] ]]; then
+      local wb_code hproxy pargs=()
+      hproxy="$(history_proxy_url || true)"
+      [[ -n "$hproxy" ]] && pargs=(--proxy "$hproxy")
+      wb_code="$(curl "${pargs[@]+"${pargs[@]}"}" -s -o /dev/null -m 10 -w '%{http_code}' https://web.archive.org/ 2>/dev/null || true)"
+      [[ "$wb_code" =~ ^[0-9]{3}$ ]] || wb_code=000
+      if [[ -n "$hproxy" ]]; then
+        log "wayback: CDX via proxy (${hproxy})"
+        wayback_cdx "$DOMAIN" "$OUT/urls_wayback.txt"
+        log "wayback(cdx): $(count "$OUT/urls_wayback.txt") URLs"
+      elif have waybackurls && [[ "$wb_code" =~ ^[23] ]]; then
         log "waybackurls: domínio ${DOMAIN} (subs incluídos)"
         timeout 900 waybackurls "$DOMAIN" > "$OUT/urls_wayback.txt" 2>>"$LOG" \
           || warn "waybackurls parcial"
         log "wayback: $(count "$OUT/urls_wayback.txt") URLs"
       elif have waybackurls; then
-        warn "waybackurls: web.archive.org inacessível (HTTP ${wb_code}) — pulando"
+        warn "waybackurls: web.archive.org inacessível (HTTP ${wb_code}) — defina HISTORY_PROXY (ex: socks5h://127.0.0.1:9050)"
       fi
       if have gau; then
-        log "gau: domínio ${DOMAIN} (--subs, providers ${GAU_PROVIDERS})"
-        timeout 1200 gau --subs --providers "$GAU_PROVIDERS" --timeout 30 --threads 5 \
-          --blacklist png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css,mp4,webp \
-          "$DOMAIN" > "$OUT/urls_gau.txt" 2>>"$LOG" || warn "gau parcial"
-        log "gau: $(count "$OUT/urls_gau.txt") URLs"
+        local cc_code
+        cc_code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' https://index.commoncrawl.org/collinfo.json 2>/dev/null || true)"
+        [[ "$cc_code" =~ ^[0-9]{3}$ ]] || cc_code=000
+        if [[ "$cc_code" =~ ^[23] ]] || (( GAU_FORCE )); then
+          log "gau: domínio ${DOMAIN} (--subs, providers ${GAU_PROVIDERS})"
+          timeout 1200 gau --subs --providers "$GAU_PROVIDERS" --timeout 30 --threads 5 \
+            --blacklist png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css,mp4,webp \
+            "$DOMAIN" > "$OUT/urls_gau.txt" 2>>"$LOG" || warn "gau parcial"
+          log "gau: $(count "$OUT/urls_gau.txt") URLs"
+        else
+          warn "gau: commoncrawl inacessível (HTTP ${cc_code}) — usando urlscan direto"
+        fi
       fi
+      # fallback: urlscan API (web.archive/commoncrawl bloqueados nesta rede)
+      urlscan_history "$DOMAIN" "$OUT/urls_urlscan.txt"
+      log "urlscan: $(count "$OUT/urls_urlscan.txt") URLs"
     fi
   fi
 
@@ -880,8 +1013,10 @@ phase_content() {
   fi
 
   # ── Merge + dedup inteligente ────────────────────────────────────────────
-  cat "$OUT/urls_katana.txt" "$OUT/urls_wayback.txt" "$OUT/urls_gau.txt" 2>/dev/null \
-    | grep -E '^https?://' | sed -E 's/#.*$//' | awk 'NF' | sort -u > "$OUT/endpoints_crawl_raw.txt" || true
+  cat "$OUT/urls_katana.txt" "$OUT/urls_wayback.txt" "$OUT/urls_gau.txt" "$OUT/urls_urlscan.txt" 2>/dev/null \
+    | grep -E '^https?://' | sed -E 's/#.*$//' \
+    | grep -Eiv 'data:|base64|javascript:|mailto:|%22data|%3Csvg' \
+    | awk 'NF && length($0) < 2000' | sort -u > "$OUT/endpoints_crawl_raw.txt" || true
 
   if have uro && [[ -s "$OUT/endpoints_crawl_raw.txt" ]]; then
     uro -i "$OUT/endpoints_crawl_raw.txt" -o "$OUT/endpoints_crawl.txt" 2>>"$LOG" \
@@ -890,12 +1025,13 @@ phase_content() {
     cp -f "$OUT/endpoints_crawl_raw.txt" "$OUT/endpoints_crawl.txt" 2>/dev/null || : > "$OUT/endpoints_crawl.txt"
   fi
 
-  log "content: $(count "$OUT/endpoints_crawl.txt") endpoints em $((SECONDS - t0))s (katana $(count "$OUT/urls_katana.txt") / wayback $(count "$OUT/urls_wayback.txt") / gau $(count "$OUT/urls_gau.txt"))"
+  log "content: $(count "$OUT/endpoints_crawl.txt") endpoints em $((SECONDS - t0))s (katana $(count "$OUT/urls_katana.txt") / wayback $(count "$OUT/urls_wayback.txt") / gau $(count "$OUT/urls_gau.txt") / urlscan $(count "$OUT/urls_urlscan.txt"))"
   db_log content katana ok "$OUT/endpoints_crawl.txt" \
     "endpoints=$(count "$OUT/endpoints_crawl.txt") auth=$([[ ${#HDRS[@]} -gt 0 ]] && echo yes || echo no)" 0
   stamp "$OUT/endpoints_crawl.txt" katana
   stamp "$OUT/urls_wayback.txt" waybackurls
   stamp "$OUT/urls_gau.txt" gau
+  stamp "$OUT/urls_urlscan.txt" urlscan
 }
 
 # =============================================================================
@@ -903,6 +1039,7 @@ phase_content() {
 # =============================================================================
 phase_js() {
   mkdir -p "$JS_DIR"
+  rm -f "$JS_DIR/.failed.tsv"
   : > "$JS_MANIFEST"
 
   cat "$OUT/endpoints_crawl.txt" 2>/dev/null \
@@ -913,9 +1050,13 @@ phase_js() {
     xargs -r -P "$THREADS" -I{} bash -c 'dl_js "$1"' _ {} < "$OUT/js_files.txt" \
       || warn "download JS parcial"
   fi
-  local downloaded
+  local attempted
+  attempted="$(count "$OUT/js_files.txt")"
   downloaded="$(find "$JS_DIR" -maxdepth 1 -type f -name '*.js' 2>/dev/null | wc -l | tr -d ' ')"
-  log "js: ${downloaded} arquivo(s) baixado(s)"
+  log "js: ${downloaded}/${attempted} arquivo(s) baixado(s) (resto: 403/404/bloqueio)"
+  if [[ -s "$JS_DIR/.failed.tsv" ]]; then
+    log "js: falhas por status: $(cut -f1 "$JS_DIR/.failed.tsv" 2>/dev/null | sort | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}')"
+  fi
 
   # Sourcemaps → código original + rotas
   if (( downloaded > 0 )); then
@@ -933,14 +1074,43 @@ phase_js() {
   jq -r 'select(.url != null) | .url' "$OUT/js_endpoints.jsonl" 2>/dev/null \
     | awk 'NF && $0 != "EXPR"' | sort -u > "$OUT/js_endpoints.txt" || : > "$OUT/js_endpoints.txt"
 
-  # Rotas originais dos sourcemaps
+  # 2ª rodada: baixar chunks .js descobertos dentro dos bundles (mais API routes)
+  if (( MAX_JS_EXTRA > 0 )); then
+    grep -Ei '^https?://[^?#]+\.(m?js)(\?|$)' "$OUT/js_endpoints.txt" 2>/dev/null \
+      | grep -Eiv '/(node_modules|@ember)/' | sort -u | head -n "$MAX_JS_EXTRA" \
+      > "$OUT/js_files_extra.txt" || true
+    if [[ -s "$OUT/js_files_extra.txt" ]]; then
+      log "js: 2ª rodada — $(count "$OUT/js_files_extra.txt") chunk(s) .js"
+      xargs -r -P "$THREADS" -I{} bash -c 'dl_js "$1"' _ {} < "$OUT/js_files_extra.txt" \
+        || warn "download extra parcial"
+      find "$JS_DIR" -maxdepth 1 -type f -name '*.js' -print0 2>/dev/null \
+        | xargs -0 -r -P "$THREADS" -I{} bash -c 'js_urls "$1"' _ {} \
+        >> "$OUT/js_endpoints.jsonl" 2>>"$LOG" || warn "jsluice (2ª) parcial"
+      jq -r 'select(.url != null) | .url' "$OUT/js_endpoints.jsonl" 2>/dev/null \
+        | awk 'NF && $0 != "EXPR"' | sort -u > "$OUT/js_endpoints.txt" || true
+      downloaded="$(find "$JS_DIR" -maxdepth 1 -type f -name '*.js' 2>/dev/null | wc -l | tr -d ' ')"
+      log "js: após 2ª rodada, ${downloaded} arquivo(s) e $(count "$OUT/js_endpoints.txt") rotas"
+    fi
+  fi
+
+  # Rotas originais dos sourcemaps (guarda as fontes e só aceita caminho válido)
   if (( downloaded > 0 )); then
     find "$JS_DIR" -maxdepth 1 -type f -name '*.map.js' -print0 2>/dev/null \
       | xargs -0 -r -P "$THREADS" -I{} bash -c 'jq -r ".sources[]? // empty" "$1" 2>/dev/null' _ {} \
-      | awk 'NF' | sed "s#^webpack://##; s#^\./##" | sed "s#^#https://${DOMAIN}/#" \
+      | awk 'NF' \
+      | sed -E 's#^(webpack://|webpack:///|\./)+##' \
+      | sort -u > "$OUT/js_sources.txt" 2>/dev/null || true
+    sed -E 's#^(\.\./)+##; s#^/##' "$OUT/js_sources.txt" 2>/dev/null \
+      | grep -Eiv '\.(ts|tsx|jsx|gjs|gts|vue|svelte|scss|sass|less|map|coffee)$' \
+      | grep -Ev '(^|/)\.\./|(^|/)node_modules/|(^|/)@ember/' \
+      | grep -Ei '(^|/)(api|graphql|rpc|bff|v[0-9]+)(/|$)' \
+      | sed "s#^#https://${DOMAIN}/#" \
       | sort -u >> "$OUT/js_endpoints.txt" || true
   fi
-  sort -u -o "$OUT/js_endpoints.txt" "$OUT/js_endpoints.txt" 2>/dev/null || true
+  # remove lixo de sourcemap/arquivos de fonte do conjunto de rotas
+  grep -Eiv '\.(ts|tsx|jsx|gjs|gts|vue|svelte|scss|sass|less|map|coffee)$' "$OUT/js_endpoints.txt" 2>/dev/null \
+    | grep -Ev '/\.\./|/node_modules/|/@ember/' | sort -u > "$OUT/js_endpoints.clean" 2>/dev/null || true
+  mv -f "$OUT/js_endpoints.clean" "$OUT/js_endpoints.txt" 2>/dev/null || true
 
   # Segredos: jsluice (rápido) + trufflehog (profundo)
   : > "$OUT/js_secrets.jsonl"
@@ -968,6 +1138,21 @@ phase_js() {
       || cp -f "$OUT/endpoints_all_raw.txt" "$OUT/endpoints.txt"
   else
     cp -f "$OUT/endpoints_all_raw.txt" "$OUT/endpoints.txt" 2>/dev/null || : > "$OUT/endpoints.txt"
+  fi
+
+  # só URLs do alvo (remove CDN de terceiros, youtube, discourse-cdn, etc.)
+  if (( SCOPE_ENDPOINTS )); then
+    grep -Ei "^https?://([a-z0-9_-]+\.)*${DOMAIN//./\\.}(/|:|$)" "$OUT/endpoints.txt" \
+      | grep -Eiv "^https?://(${CRAWL_EXCLUDE})\." \
+      | grep -Eiv 'data:|base64|javascript:|mailto:|%22data|%3Csvg' \
+      | grep -Ev '\[|\]|\*|\{|\}|<|>|"|\\| |%5C|%20' \
+      | awk 'length($0) < 2000' \
+      > "$OUT/.ep_scope" 2>/dev/null || true
+    if [[ -s "$OUT/.ep_scope" ]]; then
+      mv -f "$OUT/.ep_scope" "$OUT/endpoints.txt"
+    else
+      rm -f "$OUT/.ep_scope"
+    fi
   fi
 
   log "js: $(count "$OUT/js_endpoints.txt") rotas extraídas | $(count "$OUT/js_secrets.txt") segredos | endpoints totais: $(count "$OUT/endpoints.txt")"
@@ -1013,15 +1198,34 @@ phase_params() {
   if (( SKIP_ARJUN )); then
     log "arjun: pulado (--skip-arjun)"
   elif have arjun; then
-    # prioriza os alvos "de aplicação" (crawl_targets) em vez de pegar live.txt cru
-    head -n "$MAX_ARJUN" "$OUT/crawl_targets.txt" > "$OUT/arjun_targets.txt" 2>/dev/null || true
-    if [[ ! -s "$OUT/arjun_targets.txt" ]]; then
-      awk '{print $1}' "$OUT/live.txt" 2>/dev/null \
-        | grep -oE '^https?://[^/]+' | sort -u | head -n "$MAX_ARJUN" > "$OUT/arjun_targets.txt" || true
+    # 1) candidatos: 200 + HTML + não-CDN (CDN/WAF costuma pendurar sem auth)
+    local cand="$OUT/.arjun_cand.txt"
+    jq -r 'select(.status_code == 200 and ((.cdn // false) | not) and ((.content_type // "") | test("html"; "i"))) | .url' \
+      "$OUT/live.jsonl" 2>/dev/null | awk '!seen[$0]++' | head -n 200 > "$cand" || true
+
+    # 2) probe rápido: só mantém quem responde < 3s
+    if [[ -s "$cand" ]]; then
+      log "arjun: filtrando $(count "$cand") candidatos (200/HTML/não-CDN, <3s)"
+      xargs -r -P 10 -I{} bash -c 'arjun_probe_one "$1"' _ {} \
+        < "$cand" > "$OUT/arjun_targets.txt" 2>>"$LOG" || true
     fi
-    log "arjun: $(count "$OUT/arjun_targets.txt") origins priorizados (P=5, parametros ocultos)"
-    xargs -r -P 5 -I{} bash -c 'arjun_one "$1"' _ {} < "$OUT/arjun_targets.txt" 2>>"$LOG" || warn "arjun parcial"
-    cat "$ARJUN_DIR"/*.txt 2>/dev/null | awk 'NF' | sort -u > "$OUT/arjun_params.txt" || true
+    if [[ ! -s "$OUT/arjun_targets.txt" ]]; then
+      if (( ARJUN_FALLBACK )); then
+        log "arjun: nenhum alvo responsivo — fallback crawl_targets"
+        head -n "$MAX_ARJUN" "$OUT/crawl_targets.txt" > "$OUT/arjun_targets.txt" 2>/dev/null || true
+      else
+        log "arjun: nenhum alvo responsivo — pulando fase"
+      fi
+    fi
+
+    if [[ -s "$OUT/arjun_targets.txt" ]]; then
+      head -n "$MAX_ARJUN" "$OUT/arjun_targets.txt" > "$OUT/.arjun_final.txt" 2>/dev/null || true
+      mv -f "$OUT/.arjun_final.txt" "$OUT/arjun_targets.txt" 2>/dev/null || true
+      log "arjun: $(count "$OUT/arjun_targets.txt") origins responsivos (P=5, wordlist $(basename "$ARJUN_WORDLIST"))"
+      timeout "$ARJUN_PHASE_TIMEOUT" xargs -r -P 5 -I{} bash -c 'arjun_one "$1"' _ {} \
+        < "$OUT/arjun_targets.txt" 2>>"$LOG" || warn "arjun: timeout/parcial (${ARJUN_PHASE_TIMEOUT}s)"
+      cat "$ARJUN_DIR"/*.txt 2>/dev/null | awk 'NF' | sort -u > "$OUT/arjun_params.txt" || true
+    fi
   else
     warn "arjun ausente"
   fi
@@ -1035,16 +1239,33 @@ phase_params() {
 # =============================================================================
 #  FASE 5 — FILTRO DE DINHEIRO (business logic)
 # =============================================================================
+# Bucket por palavra-chave, ignorando o nome do alvo (evita "nuBANK" casar com "bank")
+hv_bucket() {
+  local out="$1" re="$2" src="$3"
+  awk -v re="$re" '{
+      u = $0
+      gsub(/nubank\.com\.br/, "", u)
+      gsub(/nu\.com(\.mx|\.co)?/, "", u)
+      if (u ~ re) print $0
+    }' "$src" 2>/dev/null | sort -u > "$out" || : > "$out"
+}
+
 phase_high_value() {
   local src="$OUT/endpoints.txt"
   [[ -s "$src" ]] || { warn "high-value: sem endpoints"; return 0; }
   [[ -n "${HV_AWK:-}" ]] || HV_AWK="$(mktemp /tmp/opencode/hv-XXXXXX.awk 2>/dev/null || echo /tmp/opencode/hv.awk)"
 
-  local kws="withdraw:12,transfer:12,payout:12,payment:10,checkout:10,wallet:10,redeem:10,admin:10,internal:10,apikey:10,api_key:10,kyc:10,bank:10,balance:8,invoice:8,billing:8,refund:8,transaction:8,coupon:8,subscription:8,order:8,profile:8,account:8,password:8,role:8,permission:8,graphql:8,webhook:8,oauth:8,jwt:8,iban:8,card:8,ssn:8,secret:8,credit:6,debit:6,manage:6,invite:6,api/v1:6,api/v2:6,api/v3:6,api/v4:6,user:6,reset:6,token:6,session:6,export:6,download:6,upload:6,import:6,delete:6,update:6,bulk:6,staff:6,sso:6,saml:6,mfa:6,2fa:6,verify:6,discount:6,plan:4,signup:4,register:4,callback:4"
+  local kws="withdraw:12,transfer:12,payout:12,payment:10,checkout:10,wallet:10,redeem:10,admin:10,internal:10,apikey:10,api_key:10,kyc:10,balance:8,invoice:8,billing:8,refund:8,transaction:8,coupon:8,subscription:8,order:8,profile:8,account:8,password:8,role:8,permission:8,graphql:8,webhook:8,oauth:8,jwt:8,iban:8,card:8,ssn:8,secret:8,credit:6,debit:6,manage:6,invite:6,api/v1:6,api/v2:6,api/v3:6,api/v4:6,user:6,reset:6,token:6,session:6,export:6,download:6,upload:6,import:6,delete:6,update:6,bulk:6,staff:6,sso:6,saml:6,mfa:6,2fa:6,verify:6,discount:6,plan:4,signup:4,register:4,callback:4"
+
+  # assets e caminhos de sourcemap não são alvo de validação manual
+  local scan="$OUT/.hv_scan.txt"
+  grep -Eiv '\.(js|mjs|css|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|ts|tsx|jsx|gjs|gts|vue|svelte|scss|sass|less|coffee|pdf|zip|gz|mp4|webp)(\?|$)' "$src" 2>/dev/null \
+    | grep -Ev '/node_modules/|/\.\./' > "$scan" 2>/dev/null || true
+  [[ -s "$scan" ]] || cp -f "$src" "$scan"
 
   # Superfície de ataque mastigada: só endpoints com query e só rotas de API
-  grep -E '\?' "$src" 2>/dev/null | sort -u > "$OUT/endpoints_params.txt" || true
-  grep -Ei '/(api|rest|graphql|rpc|bff|internal|admin)(/|$)|/v[0-9]+/' "$src" 2>/dev/null \
+  grep -E '\?' "$scan" 2>/dev/null | sort -u > "$OUT/endpoints_params.txt" || true
+  grep -Ei '/(api|rest|graphql|rpc|bff|internal|admin)(/|$)|/v[0-9]+/' "$scan" 2>/dev/null \
     | sort -u > "$OUT/endpoints_api.txt" || true
   log "superfície: $(count "$OUT/endpoints_params.txt") endpoints com params | $(count "$OUT/endpoints_api.txt") rotas de API"
 
@@ -1062,25 +1283,21 @@ BEGIN {
 }
 AWK
 
-  HV_KWS="$kws" awk -f "$HV_AWK" "$src" 2>/dev/null \
+  HV_KWS="$kws" awk -f "$HV_AWK" "$scan" 2>/dev/null \
     | sort -t$'\t' -k1,1nr -k3,3 \
     | awk -F'\t' '!seen[$3]++' > "$OUT/high_value_targets_scored.tsv" || true
 
-  awk -F'\t' '{print $3}' "$OUT/high_value_targets_scored.tsv" 2>/dev/null \
-    | head -n 500 > "$OUT/high_value_targets.txt" || : > "$OUT/high_value_targets.txt"
+  awk -F'\t' 'NR <= 500 {print $3}' "$OUT/high_value_targets_scored.tsv" 2>/dev/null \
+    | grep -Eiv "^https?://(${CRAWL_EXCLUDE})\." \
+    > "$OUT/high_value_targets.txt" 2>/dev/null || true
 
-  grep -Ei 'pay|transfer|withdraw|payout|billing|invoice|refund|wallet|balance|credit|debit|transaction|coupon|redeem|checkout|subscription|order|cart|bank|card|iban' \
-    "$OUT/high_value_targets.txt" 2>/dev/null | sort -u > "$OUT/hv_payments.txt" || : > "$OUT/hv_payments.txt"
-  grep -Ei 'admin|internal|staff|manage|role|permission|superuser|console|backoffice|dashboard' \
-    "$OUT/high_value_targets.txt" 2>/dev/null | sort -u > "$OUT/hv_admin.txt" || : > "$OUT/hv_admin.txt"
-  grep -Ei '/api/|graphql|webhook|/v[0-9]+/|/rpc' \
-    "$OUT/high_value_targets.txt" 2>/dev/null | sort -u > "$OUT/hv_api.txt" || : > "$OUT/hv_api.txt"
-  grep -Ei 'login|logout|auth|token|session|password|reset|mfa|2fa|sso|oauth|saml|jwt|apikey|api_key|signup|register' \
-    "$OUT/high_value_targets.txt" 2>/dev/null | sort -u > "$OUT/hv_auth.txt" || : > "$OUT/hv_auth.txt"
-  grep -Ei 'export|download|upload|import|kyc|ssn|pii|profile|account|document|report' \
-    "$OUT/high_value_targets.txt" 2>/dev/null | sort -u > "$OUT/hv_data.txt" || : > "$OUT/hv_data.txt"
+  hv_bucket "$OUT/hv_payments.txt" 'pay|transfer|withdraw|payout|billing|invoice|refund|wallet|balance|credit|debit|transaction|coupon|redeem|checkout|subscription|order|cart|card|bank|iban' "$OUT/high_value_targets.txt"
+  hv_bucket "$OUT/hv_admin.txt" 'admin|internal|staff|manage|role|permission|superuser|console|backoffice|dashboard' "$OUT/high_value_targets.txt"
+  hv_bucket "$OUT/hv_api.txt" '(/api/|graphql|webhook|/v[0-9]+/|/rpc)' "$OUT/high_value_targets.txt"
+  hv_bucket "$OUT/hv_auth.txt" 'login|logout|auth|token|session|password|reset|mfa|2fa|sso|oauth|saml|jwt|apikey|api_key|signup|register' "$OUT/high_value_targets.txt"
+  hv_bucket "$OUT/hv_data.txt" 'export|download|upload|import|kyc|ssn|pii|profile|account|document|report' "$OUT/high_value_targets.txt"
 
-  rm -f "$HV_AWK"
+  rm -f "$HV_AWK" "$scan"
   log "high-value: $(count "$OUT/high_value_targets.txt") alvos ranqueados (payments=$(count "$OUT/hv_payments.txt") admin=$(count "$OUT/hv_admin.txt") api=$(count "$OUT/hv_api.txt") auth=$(count "$OUT/hv_auth.txt") data=$(count "$OUT/hv_data.txt"))"
   db_log high_value awk ok "$OUT/high_value_targets.txt" \
     "ranked=$(count "$OUT/high_value_targets.txt") payments=$(count "$OUT/hv_payments.txt") api=$(count "$OUT/hv_api.txt")" 0
@@ -1270,12 +1487,13 @@ scope_check() { scope_check_target "$TARGET"; }
 
 print_plan() {
   local t st i=0
-  printf '\nPLANO — %d alvo(s) | threads=%s | perfil=%s | ports=%s | katana=%s depth=%s chunk=%s | jsl=%s aff=%s escopo=%s | brute=%s | fresh=%s | force=%s\n' \
+  printf '\nPLANO — %d alvo(s) | threads=%s | perfil=%s | ports=%s | katana=%s depth=%s chunk=%s | jsl=%s aff=%s escopo=%s | brute=%s | hist-proxy=%s | fresh=%s | force=%s\n' \
     "${#TARGETS[@]}" "$THREADS" "$PROFILE_LABEL" "$PORTS_MODE" \
     "$([[ "$KATANA_MAX_HOSTS" == "0" ]] && echo all || echo "$KATANA_MAX_HOSTS")" \
     "$KATANA_DEPTH" "$KATANA_CHUNK" \
     "$(onoff "$KATANA_JSLUICE")" "$(onoff "$KATANA_AFF")" "$KATANA_FS" \
     "$([[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on)" \
+    "$HISTORY_PROXY" \
     "$(onoff "$FRESH")" "$(onoff "$FORCE")"
   printf '  %-3s %-48s %-8s %s\n' "#" "target" "scope" "output"
   for t in "${TARGETS[@]}"; do
@@ -1371,14 +1589,19 @@ ui_load_conf() {
   while IFS='=' read -r k v; do
     case "$k" in
       THEME) [[ -n "$v" ]] && THEME="$v" ;;
+      HISTORY_PROXY) [[ -z "${HISTORY_PROXY_ENV:-}" && -n "$v" ]] && HISTORY_PROXY="$v" ;;
     esac
-  done < <(grep -E '^THEME=' "$UI_CONF" 2>/dev/null)
+  done < <(grep -E '^(THEME|HISTORY_PROXY)=' "$UI_CONF" 2>/dev/null)
   return 0
 }
 
 ui_save_conf() {
   mkdir -p "$(dirname "$UI_CONF")" 2>/dev/null || true
-  printf 'THEME=%s\n' "$THEME" > "$UI_CONF" 2>/dev/null || true
+  {
+    printf 'THEME=%s\n' "$THEME"
+    printf 'HISTORY_PROXY=%s\n' "$HISTORY_PROXY"
+  } > "$UI_CONF" 2>/dev/null || true
+  chmod 600 "$UI_CONF" 2>/dev/null || true
 }
 
 ui_theme_set() {
@@ -1529,8 +1752,9 @@ set_profile_deep() {
   PORTS_MODE=full; KATANA_MAX_HOSTS=0; KATANA_DEPTH=3; KATANA_JSLUICE=0
   KATANA_AFF=0; KATANA_FS=fqdn; KATANA_CHUNK=10
   SKIP_BRUTE=0; MAX_PERMUTATIONS=20000; PERM_INPUT=4000
-  MAX_JS=6000; MAX_ARJUN=50; KATANA_CHUNK_TIMEOUT=300
+  MAX_JS=6000; MAX_JS_EXTRA=1500; MAX_ARJUN=20; KATANA_CHUNK_TIMEOUT=300
   KATANA_MAX_URLS_PER_CHUNK=30000; SUBFINDER_MAX_TIME=8
+  ARJUN_PHASE_TIMEOUT=900
 }
 
 set_profile_default() {
@@ -1538,7 +1762,8 @@ set_profile_default() {
   PORTS_MODE=quick; KATANA_MAX_HOSTS=120; KATANA_DEPTH=3; KATANA_JSLUICE=0
   KATANA_AFF=0; KATANA_FS=fqdn; KATANA_CHUNK=25
   SKIP_BRUTE=1; MAX_PERMUTATIONS=6000; PERM_INPUT=1500
-  MAX_JS=3000; MAX_ARJUN=15; KATANA_CHUNK_TIMEOUT=240
+  MAX_JS=3000; MAX_JS_EXTRA=800; MAX_ARJUN=15; KATANA_CHUNK_TIMEOUT=240
+  KATANA_MAX_URLS_PER_CHUNK=20000; ARJUN_PHASE_TIMEOUT=420
   SUBFINDER_MAX_TIME=3
 }
 
@@ -1566,6 +1791,8 @@ settings_menu() {
     printf '  16) katana escopo ...... %s\n' "$KATANA_FS"
     printf '  17) katana fsu ......... %s\n' "$(onoff "$KATANA_FSU")"
     printf '  18) katana teto/chunk .. %s\n' "$KATANA_MAX_URLS_PER_CHUNK"
+    printf '  19) katana headless .... %s\n' "$(onoff "$KATANA_HEADLESS")"
+    printf '  20) history proxy ...... %s\n' "$HISTORY_PROXY"
     printf '   0) voltar\n'
     read -rp "  opção> " opt || return 0
     case "$opt" in
@@ -1598,6 +1825,9 @@ settings_menu() {
       17) KATANA_FSU=$((1 - KATANA_FSU)); mark_custom ;;
       18) read -rp "  teto de URLs por chunk [${KATANA_MAX_URLS_PER_CHUNK}]: " val || continue
          if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1000 )); then KATANA_MAX_URLS_PER_CHUNK="$val"; mark_custom; else warn "mínimo 1000"; fi ;;
+      19) KATANA_HEADLESS=$((1 - KATANA_HEADLESS)); mark_custom ;;
+      20) read -rp "  auto | off | socks5h://host:porta [${HISTORY_PROXY}]: " val || continue
+          if [[ -n "$val" ]]; then HISTORY_PROXY="$val"; ui_save_conf; log "history proxy: ${HISTORY_PROXY}"; fi ;;
       0|"") return 0 ;;
       *) warn "opção inválida: ${opt}" ;;
     esac
@@ -1721,9 +1951,23 @@ run_one_target() {
     fi
   fi
 
+  # lock por alvo: impede duas runs simultâneas no mesmo alvo (corrompia artefatos)
+  local lock_fd=0
+  if have flock; then
+    exec {lock_fd}>"/tmp/opencode/recon-${TARGET}.lock" || lock_fd=0
+    if (( lock_fd > 0 )) && ! flock -n "$lock_fd"; then
+      warn "já existe uma run ativa para ${TARGET} — pulando (lock)"
+      db_log batch "$TARGET" skipped "" "locked" 0
+      BATCH_ROWS+=("${TARGET}|skip-lock|0|0|0|0|0")
+      exec {lock_fd}>&-
+      return 3
+    fi
+  fi
+
   if (( FRESH )) && [[ -d "$OUT" ]]; then
     if [[ "$OUT" != "${DOCS_ROOT}/"* ]]; then
       warn "recusando rm -rf em ${OUT}"
+      (( lock_fd > 0 )) && exec {lock_fd}>&- || true
       return 1
     fi
     rm -rf "$OUT"
@@ -1741,11 +1985,12 @@ run_one_target() {
       "katana    chunk ${KATANA_CHUNK} · jsl $(onoff "$KATANA_JSLUICE") · aff $(onoff "$KATANA_AFF") · escopo ${KATANA_FS}" \
       "escopo    ok · bruteforce $( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on )" \
       "saída     ${OUT}" \
+      "parar     Ctrl-C ou kill -TERM $$" \
       "estimado  $( [[ $DEEP -eq 1 ]] && echo '1.5-2.5 h' || echo '30-45 min (alvo grande)' )"
   fi
 
   # variáveis usadas pelos filhos de xargs -P
-  export JS_DIR JS_MANIFEST ARJUN_DIR DOMAIN HDR_BLOB AUTH_RC
+  export JS_DIR JS_MANIFEST ARJUN_DIR DOMAIN HDR_BLOB AUTH_RC UA ARJUN_TIMEOUT ARJUN_WORDLIST
 
   log "════════════════════════════════════════════════════════════"
   log "recon_high_end v${VERSION} | alvo=${TARGET} | threads=${THREADS}"
@@ -1774,6 +2019,7 @@ run_one_target() {
   db_log batch "$TARGET" done "$OUT" \
     "subs=$(count "$OUT/subdomains.txt") live=$(count "$OUT/live.txt") hv=$(count "$OUT/high_value_targets.txt")" "$dur"
   [[ -n "${HV_AWK:-}" && -f "$HV_AWK" ]] && rm -f "$HV_AWK"
+  (( lock_fd > 0 )) && exec {lock_fd}>&- || true
   return 0
 }
 
