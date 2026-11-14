@@ -81,7 +81,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && -z "${RECON_SELFCOPY:-}" ]]; then
   fi
 fi
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 SELF="${RECON_ORIG_NAME:-$(basename "$0")}"
 
 # ── Configuração (sobrescreva por env) ───────────────────────────────────────
@@ -121,6 +121,17 @@ KATANA_AFF="${KATANA_AFF:-0}"            # automatic form fill
 KATANA_FSU="${KATANA_FSU:-1}"            # filtra URLs parecidas (IDs numéricos)
 KATANA_CHUNK_TIMEOUT="${KATANA_CHUNK_TIMEOUT:-240}"
 KATANA_MAX_URLS_PER_CHUNK="${KATANA_MAX_URLS_PER_CHUNK:-20000}"
+# limites de expansão/memória do katana (o default do katana é -p 10: 10 hosts em
+# paralelo no mesmo processo → RAM multiplicada por 10 e estouro do host)
+KATANA_PARALLEL="${KATANA_PARALLEL:-2}"        # -p: hosts simultâneos por processo
+KATANA_MAX_PAGES="${KATANA_MAX_PAGES:-300}"    # -mdp: teto de páginas por domínio (0 = ilimitado)
+KATANA_CRAWL_TIME="${KATANA_CRAWL_TIME:-0}"    # -ct: duração máx. do chunk em s (0 = sem teto)
+KATANA_MAX_RESPONSE="${KATANA_MAX_RESPONSE:-2097152}"  # -mrs: máx. bytes lidos por resposta (2MB)
+KATANA_FST="${KATANA_FST:-5}"                  # -fst: limiar do -fsu (menor = filtra mais URLs)
+KATANA_IQP="${KATANA_IQP:-0}"                  # -iqp: ignora variações de query string
+KATANA_MEM_LIMIT_MB="${KATANA_MEM_LIMIT_MB:-2048}"  # teto de RAM por chunk via cgroup v2 (0 = off)
+KATANA_RETRY_SPLIT="${KATANA_RETRY_SPLIT:-1}"  # 1 = chunk que estourar é re-tentado host a host
+KATANA_SAFE_TIMEOUT="${KATANA_SAFE_TIMEOUT:-45}"    # timeout do modo leve (host a host)
 # hosts de conteúdo/estático fora do crawl (economiza horas e ruído)
 CRAWL_EXCLUDE="${CRAWL_EXCLUDE:-cdn|static|img[0-9]*|images|assets|media|files|downloads?|fonts|blog|backend\.blog|www\.blog|building|novidades|estagio|comunidad|comunidade|community|foro|forum|discourse|help|suporte|ajuda|careers|carreiras|newsroom|imprensa|status|trust|privacidade|legal|termos}"
 # wayback está bloqueado nesta rede; commoncrawl/urlscan funcionam
@@ -194,7 +205,14 @@ OPÇÕES
   --katana-hosts N      teto de hosts no crawl (0 = todos)
   --katana-depth N      profundidade do crawl
   --katana-chunk N      hosts por processo do katana (memória)
+  --katana-parallel N   hosts simultâneos dentro do processo (-p; default 2)
+  --katana-max-pages N  páginas por domínio (-mdp; 0 = ilimitado)
+  --katana-mem N        teto de RAM por chunk em MB via cgroup v2 (0 = off)
   -h, --help            esta ajuda
+  -V, --version         versão
+
+DOC
+  scripts/README-recon_high_end.md
 
 MULTI-TARGET
   Alvos são executados em sequência (1 por vez) para não saturar o alvo.
@@ -203,7 +221,7 @@ MULTI-TARGET
 
 MENU [7] OPÇÕES
   Controla tudo: perfil DEEP (liga/desliga), threads, skip-brute, ports mode,
-  katana hosts/depth/chunk, skip-history, skip-arjun, skip-chaos, fresh, force.
+  katana hosts/depth/chunk/p/mdp/RAM, skip-history, skip-arjun, skip-chaos, fresh, force.
   A linha de status abaixo da lista mostra o perfil ativo antes de rodar.
 
 ENV
@@ -213,6 +231,8 @@ ENV
   SUBFINDER_ALL SUBFINDER_RECURSIVE SUBFINDER_MAX_TIME SUBFINDER_TIMEOUT
   PORTS_MODE KATANA_CHUNK KATANA_MAX_HOSTS KATANA_DEPTH KATANA_JSLUICE
   KATANA_AFF KATANA_FSU KATANA_CHUNK_TIMEOUT KATANA_MAX_URLS_PER_CHUNK
+  KATANA_PARALLEL KATANA_MAX_PAGES KATANA_CRAWL_TIME KATANA_MAX_RESPONSE
+  KATANA_FST KATANA_IQP KATANA_MEM_LIMIT_MB KATANA_RETRY_SPLIT KATANA_SAFE_TIMEOUT
   HISTORY_PER_HOST MAX_JS MAX_ARJUN CRAWL_EXCLUDE GAU_PROVIDERS
   ARJUN_TIMEOUT ARJUN_PHASE_TIMEOUT ARJUN_WORDLIST
   HISTORY_PROXY CDX_LIMIT URLSCAN_PAGES GAU_FORCE
@@ -335,6 +355,7 @@ AUTH_RC=""
 HV_AWK=""
 
 cleanup() {
+  declare -F katana_mem_teardown >/dev/null && katana_mem_teardown
   [[ -n "$AUTH_RC" && -f "$AUTH_RC" ]] && rm -f "$AUTH_RC"
   [[ -n "$HV_AWK" && -f "$HV_AWK" ]] && rm -f "$HV_AWK"
   [[ -n "${RECON_SELFCOPY:-}" && -f "$RECON_SELFCOPY" ]] && rm -f "$RECON_SELFCOPY"
@@ -902,6 +923,54 @@ urlscan_history() {  local d="$1" out="$2" pages="${URLSCAN_PAGES:-3}" i=0 json 
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# katana: execução com teto de memória (cgroup v2) + fallback host a host
+# -----------------------------------------------------------------------------
+KATANA_CG_DIR=""
+
+# Cria um cgroup com memory.max. Devolve 1 se não for possível (sem cgroup v2).
+katana_mem_setup() {
+  KATANA_CG_DIR=""
+  (( ${KATANA_MEM_LIMIT_MB:-0} > 0 )) || return 1
+  local root=/sys/fs/cgroup cg
+  [[ -w "$root/cgroup.procs" ]] || return 1
+  if ! grep -qw memory "$root/cgroup.subtree_control" 2>/dev/null; then
+    printf '+memory\n' > "$root/cgroup.subtree_control" 2>/dev/null || true
+  fi
+  cg="$root/recon-katana-$$-$RANDOM"
+  mkdir -p "$cg" 2>/dev/null || return 1
+  if [[ ! -w "$cg/memory.max" ]]; then
+    rmdir "$cg" 2>/dev/null || true
+    return 1
+  fi
+  printf '%sM\n' "$KATANA_MEM_LIMIT_MB" > "$cg/memory.max" 2>/dev/null || true
+  printf '0\n' > "$cg/memory.swap.max" 2>/dev/null || true
+  # mata o cgroup inteiro de uma vez quando estourar (sem sobrar filho órfão)
+  printf '1\n' > "$cg/memory.oom.group" 2>/dev/null || true
+  KATANA_CG_DIR="$cg"
+  return 0
+}
+
+katana_mem_teardown() {
+  local cg="${KATANA_CG_DIR:-}"
+  KATANA_CG_DIR=""
+  [[ -n "$cg" && -d "$cg" ]] || return 0
+  [[ -w "$cg/cgroup.kill" ]] && printf '1\n' > "$cg/cgroup.kill" 2>/dev/null || true
+  rmdir "$cg" 2>/dev/null || true
+}
+
+# katana_crawl <arquivo-de-alvos> <destino> <timeout_s> [flags...]
+# Roda dentro do cgroup (se houver) e respeita o teto de URLs por chamada.
+katana_crawl() {
+  local list="$1" dest="$2" tmo="$3"; shift 3
+  local cap="${KATANA_MAX_URLS_PER_CHUNK:-20000}"
+  (
+    [[ -n "$KATANA_CG_DIR" ]] && printf '%s\n' "$BASHPID" > "$KATANA_CG_DIR/cgroup.procs" 2>/dev/null
+    exec timeout "$tmo" katana -list "$list" "$@" 2>>"$LOG"
+  ) | head -n "$cap" >> "$dest"
+  return "${PIPESTATUS[0]}"
+}
+
 phase_content() {
   local t0=$SECONDS
   : > "$OUT/urls_katana.txt"; : > "$OUT/urls_wayback.txt"; : > "$OUT/urls_gau.txt"; : > "$OUT/urls_urlscan.txt"
@@ -968,38 +1037,65 @@ phase_content() {
   [[ -s "$crawl_list" ]] || crawl_list="$OUT/live.txt"
 
   if have katana && [[ -s "$crawl_list" ]]; then
-    local extra=() chunk_dir="$OUT/.katana_chunks" f i=0 rc
-    (( KATANA_HEADLESS )) && extra+=(-hl -nos)
-    (( KATANA_AFF )) && extra+=(-aff)
-    (( KATANA_JSLUICE )) && extra+=(-jsl)
-    (( KATANA_FSU )) && extra+=(-fsu)
+    local chunk_dir="$OUT/.katana_chunks" f i=0 rc
+    # base: limites que impedem a explosão do frontier (mdp/ct/mrs/fst/p)
+    local base=(-d "$KATANA_DEPTH" -jc -xhr -kf all -fs "$KATANA_FS"
+                -rl 120 -c 5 -timeout "$HTTP_TIMEOUT" -silent -duc
+                -p "$KATANA_PARALLEL" -mrs "$KATANA_MAX_RESPONSE" -fst "$KATANA_FST")
+    (( KATANA_MAX_PAGES > 0 )) && base+=(-mdp "$KATANA_MAX_PAGES")
+    (( KATANA_CRAWL_TIME > 0 )) && base+=(-ct "${KATANA_CRAWL_TIME}s")
+    (( KATANA_IQP )) && base+=(-iqp)
+    (( KATANA_FSU )) && base+=(-fsu)
+    (( KATANA_HEADLESS )) && base+=(-hl -nos)
+    # caros: -aff (form fill experimental) e -jsl (jsluice) só se pedidos
+    local heavy=()
+    (( KATANA_AFF )) && heavy+=(-aff)
+    (( KATANA_JSLUICE )) && heavy+=(-jsl)
+    # modo leve: fallback host a host quando um chunk estoura a RAM
+    local safe=(-d 2 -jc -xhr -kf all -fs "$KATANA_FS"
+                -rl 60 -c 5 -timeout "$HTTP_TIMEOUT" -silent -duc
+                -p 1 -mrs 1048576 -fst 3 -mdp 120 -ct 45s)
+    (( KATANA_FSU )) && safe+=(-fsu)
 
     rm -rf "$chunk_dir"; mkdir -p "$chunk_dir"
     split -l "$KATANA_CHUNK" "$crawl_list" "$chunk_dir/part_" 2>/dev/null || true
     local total_chunks
     total_chunks="$(find "$chunk_dir" -name 'part_*' | wc -l | tr -d ' ')"
-    log "katana: $(count "$crawl_list") alvos em ${total_chunks} chunk(s) de ${KATANA_CHUNK} (depth ${KATANA_DEPTH}, jsl=$([[ $KATANA_JSLUICE -eq 1 ]] && echo on || echo off), aff=$([[ $KATANA_AFF -eq 1 ]] && echo on || echo off))"
+    log "katana: $(count "$crawl_list") alvos em ${total_chunks} chunk(s) de ${KATANA_CHUNK} (depth ${KATANA_DEPTH}, p=${KATANA_PARALLEL}, mdp=$( (( KATANA_MAX_PAGES > 0 )) && echo "$KATANA_MAX_PAGES" || echo off ), jsl=$([[ $KATANA_JSLUICE -eq 1 ]] && echo on || echo off), aff=$([[ $KATANA_AFF -eq 1 ]] && echo on || echo off))"
+    if katana_mem_setup; then
+      log "katana: teto de RAM ${KATANA_MEM_LIMIT_MB}MB por chunk (cgroup v2)"
+    else
+      warn "katana: cgroup v2 indisponível — valendo só os limites internos do katana"
+    fi
 
     for f in "$chunk_dir"/part_*; do
       [[ -s "$f" ]] || continue
       i=$((i + 1))
-      rc=0
       # memória baixa = não insiste (evita OOM em cascata)
-      local mem_avail
+      local mem_avail need
       mem_avail="$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || true)"
       [[ "$mem_avail" =~ ^[0-9]+$ ]] || mem_avail=9999
-      if (( mem_avail < 1200 )); then
-        warn "katana: memória livre ${mem_avail}MB — pulando chunk ${i}/${total_chunks}"
+      if (( KATANA_MEM_LIMIT_MB > 0 )); then need=$(( KATANA_MEM_LIMIT_MB + 800 )); else need=1200; fi
+      if (( mem_avail < need )); then
+        warn "katana: memória livre ${mem_avail}MB < ${need}MB — pulando chunk ${i}/${total_chunks}"
         continue
       fi
-      timeout "$KATANA_CHUNK_TIMEOUT" katana -list "$f" \
-        -d "$KATANA_DEPTH" -jc -xhr -kf all -fs "$KATANA_FS" \
-        -rl 120 -c 5 -timeout "$HTTP_TIMEOUT" -silent -duc \
-        "${extra[@]+"${extra[@]}"}" "${HDR_FLAGS[@]+"${HDR_FLAGS[@]}"}" \
-        2>>"$LOG" | head -n "$KATANA_MAX_URLS_PER_CHUNK" >> "$OUT/urls_katana.txt"
-      rc=${PIPESTATUS[0]}
-      if (( rc == 137 )); then
-        warn "katana: chunk ${i}/${total_chunks} morto por OOM — seguindo"
+      rc=0
+      # stderr da chamada vai pro log (inclui o aviso "Killed" do próprio bash)
+      katana_crawl "$f" "$OUT/urls_katana.txt" "$KATANA_CHUNK_TIMEOUT" \
+        "${base[@]}" "${heavy[@]+"${heavy[@]}"}" "${HDR_FLAGS[@]+"${HDR_FLAGS[@]}"}" 2>>"$LOG" || rc=$?
+      if (( rc == 137 && KATANA_RETRY_SPLIT )); then
+        local one="$chunk_dir/one.txt" host
+        warn "katana: chunk ${i}/${total_chunks} estourou a RAM — re-tentando host a host (modo leve)"
+        while IFS= read -r host; do
+          [[ -n "$host" ]] || continue
+          printf '%s\n' "$host" > "$one"
+          katana_crawl "$one" "$OUT/urls_katana.txt" "$KATANA_SAFE_TIMEOUT" \
+            "${safe[@]}" "${HDR_FLAGS[@]+"${HDR_FLAGS[@]}"}" 2>>"$LOG" || true
+        done < "$f"
+        rm -f "$one"
+      elif (( rc == 137 )); then
+        warn "katana: chunk ${i}/${total_chunks} estourou a RAM — seguindo"
       elif (( rc == 141 )); then
         log "katana: chunk ${i}/${total_chunks} atingiu o teto de ${KATANA_MAX_URLS_PER_CHUNK} URLs"
       elif (( rc != 0 && rc != 124 )); then
@@ -1007,6 +1103,7 @@ phase_content() {
       fi
       log "katana: chunk ${i}/${total_chunks} (acumulado $(count "$OUT/urls_katana.txt") URLs)"
     done
+    katana_mem_teardown
     rm -rf "$chunk_dir"
   else
     warn "katana ausente ou sem alvos para crawl"
@@ -1241,11 +1338,15 @@ phase_params() {
 # =============================================================================
 # Bucket por palavra-chave, ignorando o nome do alvo (evita "nuBANK" casar com "bank")
 hv_bucket() {
-  local out="$1" re="$2" src="$3"
-  awk -v re="$re" '{
+  local out="$1" re="$2" src="$3" root d_esc r_esc
+  root="$DOMAIN"
+  [[ "$DOMAIN" == *.*.* ]] && root="${DOMAIN#*.}"
+  d_esc="${DOMAIN//./\\.}"
+  r_esc="${root//./\\.}"
+  awk -v re="$re" -v d="$d_esc" -v r="$r_esc" '{
       u = $0
-      gsub(/nubank\.com\.br/, "", u)
-      gsub(/nu\.com(\.mx|\.co)?/, "", u)
+      gsub(d, "", u)
+      if (r != d) gsub(r, "", u)
       if (u ~ re) print $0
     }' "$src" 2>/dev/null | sort -u > "$out" || : > "$out"
 }
@@ -1255,7 +1356,7 @@ phase_high_value() {
   [[ -s "$src" ]] || { warn "high-value: sem endpoints"; return 0; }
   [[ -n "${HV_AWK:-}" ]] || HV_AWK="$(mktemp /tmp/opencode/hv-XXXXXX.awk 2>/dev/null || echo /tmp/opencode/hv.awk)"
 
-  local kws="withdraw:12,transfer:12,payout:12,payment:10,checkout:10,wallet:10,redeem:10,admin:10,internal:10,apikey:10,api_key:10,kyc:10,balance:8,invoice:8,billing:8,refund:8,transaction:8,coupon:8,subscription:8,order:8,profile:8,account:8,password:8,role:8,permission:8,graphql:8,webhook:8,oauth:8,jwt:8,iban:8,card:8,ssn:8,secret:8,credit:6,debit:6,manage:6,invite:6,api/v1:6,api/v2:6,api/v3:6,api/v4:6,user:6,reset:6,token:6,session:6,export:6,download:6,upload:6,import:6,delete:6,update:6,bulk:6,staff:6,sso:6,saml:6,mfa:6,2fa:6,verify:6,discount:6,plan:4,signup:4,register:4,callback:4"
+  local kws="withdraw:12,transfer:12,payout:12,payment:10,pay:10,checkout:10,wallet:10,redeem:10,admin:10,internal:10,apikey:10,api_key:10,kyc:10,pix:8,balance:8,invoice:8,billing:8,refund:8,transaction:8,coupon:8,subscription:8,order:8,profile:8,account:8,password:8,role:8,permission:8,graphql:8,webhook:8,oauth:8,jwt:8,iban:8,card:8,ssn:8,secret:8,credit:6,debit:6,manage:6,invite:6,api/v1:6,api/v2:6,api/v3:6,api/v4:6,user:6,reset:6,token:6,session:6,export:6,download:6,upload:6,import:6,delete:6,update:6,bulk:6,staff:6,sso:6,saml:6,mfa:6,2fa:6,verify:6,discount:6,plan:4,signup:4,register:4,callback:4"
 
   # assets e caminhos de sourcemap não são alvo de validação manual
   local scan="$OUT/.hv_scan.txt"
@@ -1319,7 +1420,7 @@ phase_report() {
 - **Alvo**: \`${TARGET}\` (domínio \`${DOMAIN}\`)
 - **Auth**: $([[ ${#HDRS[@]} -gt 0 ]] && echo "${#HDRS[@]} header(s) de \`${AUTH_FILE}\`" || echo "anônimo (sem auth_headers.txt)")
 - **Paralelismo**: ${THREADS} workers
-- **Perfil**: ${PROFILE_LABEL} | ports=${PORTS_MODE} | katana=$( [[ "$KATANA_MAX_HOSTS" == "0" ]] && echo "todos os hosts" || echo "${KATANA_MAX_HOSTS} hosts" ) depth=${KATANA_DEPTH} | brute=$( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on ) | jsluice=$( [[ $KATANA_JSLUICE -eq 1 ]] && echo on || echo off )
+- **Perfil**: ${PROFILE_LABEL} | ports=${PORTS_MODE} | katana=$( [[ "$KATANA_MAX_HOSTS" == "0" ]] && echo "todos os hosts" || echo "${KATANA_MAX_HOSTS} hosts" ) depth=${KATANA_DEPTH} p=${KATANA_PARALLEL} mdp=$([[ "$KATANA_MAX_PAGES" == "0" ]] && echo ilimitado || echo "$KATANA_MAX_PAGES") ram/chunk=$( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off ) | brute=$( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on ) | jsluice=$( [[ $KATANA_JSLUICE -eq 1 ]] && echo on || echo off )
 - **Histórico**: $( [[ $SKIP_HISTORY -eq 1 ]] && echo "pulado" || echo "domínio inteiro (wayback + gau)" )
 
 ## Números
@@ -1487,10 +1588,12 @@ scope_check() { scope_check_target "$TARGET"; }
 
 print_plan() {
   local t st i=0
-  printf '\nPLANO — %d alvo(s) | threads=%s | perfil=%s | ports=%s | katana=%s depth=%s chunk=%s | jsl=%s aff=%s escopo=%s | brute=%s | hist-proxy=%s | fresh=%s | force=%s\n' \
+  printf '\nPLANO — %d alvo(s) | threads=%s | perfil=%s | ports=%s | katana=%s depth=%s chunk=%s p=%s mdp=%s ram/chunk=%s | jsl=%s aff=%s escopo=%s | brute=%s | hist-proxy=%s | fresh=%s | force=%s\n' \
     "${#TARGETS[@]}" "$THREADS" "$PROFILE_LABEL" "$PORTS_MODE" \
     "$([[ "$KATANA_MAX_HOSTS" == "0" ]] && echo all || echo "$KATANA_MAX_HOSTS")" \
-    "$KATANA_DEPTH" "$KATANA_CHUNK" \
+    "$KATANA_DEPTH" "$KATANA_CHUNK" "$KATANA_PARALLEL" \
+    "$([[ "$KATANA_MAX_PAGES" == "0" ]] && echo off || echo "$KATANA_MAX_PAGES")" \
+    "$( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off )" \
     "$(onoff "$KATANA_JSLUICE")" "$(onoff "$KATANA_AFF")" "$KATANA_FS" \
     "$([[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on)" \
     "$HISTORY_PROXY" \
@@ -1754,6 +1857,7 @@ set_profile_deep() {
   SKIP_BRUTE=0; MAX_PERMUTATIONS=20000; PERM_INPUT=4000
   MAX_JS=6000; MAX_JS_EXTRA=1500; MAX_ARJUN=20; KATANA_CHUNK_TIMEOUT=300
   KATANA_MAX_URLS_PER_CHUNK=30000; SUBFINDER_MAX_TIME=8
+  KATANA_PARALLEL=1; KATANA_MAX_PAGES=1000; KATANA_MEM_LIMIT_MB=3072
   ARJUN_PHASE_TIMEOUT=900
 }
 
@@ -1764,6 +1868,7 @@ set_profile_default() {
   SKIP_BRUTE=1; MAX_PERMUTATIONS=6000; PERM_INPUT=1500
   MAX_JS=3000; MAX_JS_EXTRA=800; MAX_ARJUN=15; KATANA_CHUNK_TIMEOUT=240
   KATANA_MAX_URLS_PER_CHUNK=20000; ARJUN_PHASE_TIMEOUT=420
+  KATANA_PARALLEL=2; KATANA_MAX_PAGES=300; KATANA_MEM_LIMIT_MB=2048
   SUBFINDER_MAX_TIME=3
 }
 
@@ -1793,6 +1898,9 @@ settings_menu() {
     printf '  18) katana teto/chunk .. %s\n' "$KATANA_MAX_URLS_PER_CHUNK"
     printf '  19) katana headless .... %s\n' "$(onoff "$KATANA_HEADLESS")"
     printf '  20) history proxy ...... %s\n' "$HISTORY_PROXY"
+    printf '  21) katana paralelo ..... %s\n' "$KATANA_PARALLEL"
+    printf '  22) katana págs/domínio . %s\n' "$( (( KATANA_MAX_PAGES > 0 )) && echo "$KATANA_MAX_PAGES" || echo ilimitado )"
+    printf '  23) katana RAM/chunk .... %s\n' "$( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off )"
     printf '   0) voltar\n'
     read -rp "  opção> " opt || return 0
     case "$opt" in
@@ -1819,8 +1927,10 @@ settings_menu() {
       11) FRESH=$((1 - FRESH)) ;;
       12) FORCE=$((1 - FORCE)) ;;
       13) ui_theme_cycle; log "tema: ${THEME}" ;;
-      14) KATANA_JSLUICE=$((1 - KATANA_JSLUICE)); mark_custom ;;
-      15) KATANA_AFF=$((1 - KATANA_AFF)); mark_custom ;;
+      14) KATANA_JSLUICE=$((1 - KATANA_JSLUICE)); mark_custom
+          (( KATANA_JSLUICE )) && warn "jsluice on: parsing de JS em memória — o teto de RAM por chunk segura o OOM" ;;
+      15) KATANA_AFF=$((1 - KATANA_AFF)); mark_custom
+          (( KATANA_AFF )) && warn "form fill on: multiplica URLs (formulários/buscas) — use só em alvo pequeno" ;;
       16) case "$KATANA_FS" in fqdn) KATANA_FS=rdn ;; *) KATANA_FS=fqdn ;; esac; mark_custom ;;
       17) KATANA_FSU=$((1 - KATANA_FSU)); mark_custom ;;
       18) read -rp "  teto de URLs por chunk [${KATANA_MAX_URLS_PER_CHUNK}]: " val || continue
@@ -1828,6 +1938,12 @@ settings_menu() {
       19) KATANA_HEADLESS=$((1 - KATANA_HEADLESS)); mark_custom ;;
       20) read -rp "  auto | off | socks5h://host:porta [${HISTORY_PROXY}]: " val || continue
           if [[ -n "$val" ]]; then HISTORY_PROXY="$val"; ui_save_conf; log "history proxy: ${HISTORY_PROXY}"; fi ;;
+      21) read -rp "  hosts em paralelo por processo [${KATANA_PARALLEL}]: " val || continue
+          if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 20 )); then KATANA_PARALLEL="$val"; mark_custom; else warn "1-20"; fi ;;
+      22) read -rp "  páginas por domínio [${KATANA_MAX_PAGES}] (0=ilimitado): " val || continue
+          if [[ "$val" =~ ^[0-9]+$ ]]; then KATANA_MAX_PAGES="$val"; mark_custom; else warn "valor inválido"; fi ;;
+      23) read -rp "  RAM por chunk em MB [${KATANA_MEM_LIMIT_MB}] (0=off): " val || continue
+          if [[ "$val" =~ ^[0-9]+$ ]]; then KATANA_MEM_LIMIT_MB="$val"; mark_custom; else warn "valor inválido"; fi ;;
       0|"") return 0 ;;
       *) warn "opção inválida: ${opt}" ;;
     esac
@@ -1953,6 +2069,7 @@ run_one_target() {
 
   # lock por alvo: impede duas runs simultâneas no mesmo alvo (corrompia artefatos)
   local lock_fd=0
+  mkdir -p /tmp/opencode 2>/dev/null || true
   if have flock; then
     exec {lock_fd}>"/tmp/opencode/recon-${TARGET}.lock" || lock_fd=0
     if (( lock_fd > 0 )) && ! flock -n "$lock_fd"; then
@@ -1983,6 +2100,7 @@ run_one_target() {
       "perfil    ${PROFILE_LABEL}$( [[ $DEEP -eq 1 ]] && echo ' (deep)' || echo ' (rápido)' )" \
       "ports     ${PORTS_MODE} · katana $( [[ "$KATANA_MAX_HOSTS" == "0" ]] && echo todos || echo "${KATANA_MAX_HOSTS} hosts" ) · depth ${KATANA_DEPTH}" \
       "katana    chunk ${KATANA_CHUNK} · jsl $(onoff "$KATANA_JSLUICE") · aff $(onoff "$KATANA_AFF") · escopo ${KATANA_FS}" \
+      "katana    p ${KATANA_PARALLEL} · mdp $( (( KATANA_MAX_PAGES > 0 )) && echo "${KATANA_MAX_PAGES} págs/dom" || echo ilimitado ) · RAM/chunk $( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off )" \
       "escopo    ok · bruteforce $( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on )" \
       "saída     ${OUT}" \
       "parar     Ctrl-C ou kill -TERM $$" \
@@ -2133,6 +2251,7 @@ main() {
   while (( $# )); do
     case "$1" in
       -h|--help) usage; exit 0 ;;
+      -V|--version) printf '%s %s\n' "$SELF" "$VERSION"; exit 0 ;;
       --threads) THREADS="${2:?--threads exige valor}"; shift 2 ;;
       --fresh) FRESH=1; shift ;;
       --force) FORCE=1; shift ;;
@@ -2147,6 +2266,9 @@ main() {
       --katana-hosts) KATANA_MAX_HOSTS="${2:?--katana-hosts exige valor}"; mark_custom; shift 2 ;;
       --katana-depth) KATANA_DEPTH="${2:?--katana-depth exige valor}"; mark_custom; shift 2 ;;
       --katana-chunk) KATANA_CHUNK="${2:?--katana-chunk exige valor}"; mark_custom; shift 2 ;;
+      --katana-parallel) KATANA_PARALLEL="${2:?--katana-parallel exige valor}"; mark_custom; shift 2 ;;
+      --katana-max-pages) KATANA_MAX_PAGES="${2:?--katana-max-pages exige valor}"; mark_custom; shift 2 ;;
+      --katana-mem) KATANA_MEM_LIMIT_MB="${2:?--katana-mem exige valor}"; mark_custom; shift 2 ;;
       --skip-ports) SKIP_PORTS=1; mark_custom; shift ;;
       --skip-history) SKIP_HISTORY=1; shift ;;
       --skip-arjun) SKIP_ARJUN=1; shift ;;
@@ -2158,6 +2280,12 @@ main() {
 
   [[ "$THREADS" =~ ^[0-9]+$ ]] && (( THREADS > 0 )) || die "--threads inválido"
   case "$PORTS_MODE" in none|quick|full) ;; *) die "--ports inválido: ${PORTS_MODE} (none|quick|full)" ;; esac
+  [[ "$KATANA_PARALLEL" =~ ^[0-9]+$ ]] && (( KATANA_PARALLEL > 0 )) || die "KATANA_PARALLEL inválido (1-20)"
+  [[ "$KATANA_MAX_PAGES" =~ ^[0-9]+$ ]] || die "KATANA_MAX_PAGES inválido (use 0 para ilimitado)"
+  [[ "$KATANA_MEM_LIMIT_MB" =~ ^[0-9]+$ ]] || die "KATANA_MEM_LIMIT_MB inválido (use 0 para desligar)"
+  [[ "$KATANA_MAX_RESPONSE" =~ ^[0-9]+$ ]] || die "KATANA_MAX_RESPONSE inválido"
+  [[ "$KATANA_FST" =~ ^[0-9]+$ ]] || die "KATANA_FST inválido"
+  [[ "$KATANA_CRAWL_TIME" =~ ^[0-9]+$ ]] || die "KATANA_CRAWL_TIME inválido (segundos; 0 = sem teto)"
 
   ui_load_conf
   ui_theme_set
