@@ -41,15 +41,21 @@
 #
 #  PERFIS
 #    default (rápido)  ports=quick (top 100, -ec) | katana=120 hosts em chunks
-#                      de 25, sem -jsl/-aff | histórico por domínio (1 chamada)
-#    --deep            ports=full (top 1000) | katana=todos | depth 3 | jsl/aff
-#                      off (RAM) | bruteforce ligado | mais JS/arjun
+#                      de 25, p=2, mdp=300, RAM/chunk 2048 MB, sem -jsl/-aff
+#    --deep            ports=full (top 1000) | katana=todos | depth 3 | p=1,
+#                      mdp=1000, RAM/chunk 3072 MB, jsl/aff off | brute on
+#
+#    katana roda com -p/-mdp/-mrs/-fst e, se possível, num cgroup v2 com
+#    memory.max: chunk que estoura morre contido e é re-tentado host a host.
 #
 #    Tudo é ajustável por env (PORTS_MODE, KATANA_MAX_HOSTS, KATANA_CHUNK,
-#    KATANA_DEPTH, KATANA_JSLUICE, KATANA_AFF, HISTORY_PER_HOST, MAX_JS...).
+#    KATANA_DEPTH, KATANA_PARALLEL, KATANA_MAX_PAGES, KATANA_MEM_LIMIT_MB,
+#    KATANA_JSLUICE, KATANA_AFF, HISTORY_PER_HOST, MAX_JS...).
 #
 #  UI (menu estilo Berserk)
 #    Tema em /home/hack/targets/recon_ui.conf: berserk | matrix | cyber | mono
+#    Banners: todos os .txt de scripts/banners/ rotacionam a cada refresh do menu
+#             (BANNER_EACH=0 desliga; banner.txt é o fallback)
 #    No menu: t troca tema · a add · i import · x remover · r rodar · s seleção
 #              o opções · p pastas · q sair
 #    Cards de pré-voo/resultado aparecem só em TTY (não poluem logs).
@@ -81,7 +87,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && -z "${RECON_SELFCOPY:-}" ]]; then
   fi
 fi
 
-VERSION="1.3.0"
+VERSION="1.7.0"
 SELF="${RECON_ORIG_NAME:-$(basename "$0")}"
 
 # ── Configuração (sobrescreva por env) ───────────────────────────────────────
@@ -89,6 +95,8 @@ DOCS_ROOT="${DOCS_ROOT:-/home/hack/docs}"
 DB_PATH="${DB_PATH:-/home/hack/opencode-pentester/db/findings.db}"
 TARGETS_FILE="${TARGETS_FILE:-/home/hack/targets/recon_targets.txt}"
 BANNER_FILE="${BANNER_FILE:-/home/hack/scripts/banner.txt}"
+BANNERS_DIR="${BANNERS_DIR:-/home/hack/scripts/banners}"
+BANNER_EACH="${BANNER_EACH:-1}"          # 1 = banner em cada refresh de menu
 AUTH_FILE="${AUTH_FILE:-/home/hack/targets/auth_headers.txt}"
 GH_TOKEN_FILE="${GH_TOKEN_FILE:-/home/hack/targets/github_token}"
 CHAOS_KEY_FILE="${CHAOS_KEY_FILE:-/home/hack/targets/chaos_key}"
@@ -109,6 +117,8 @@ ARJUN_FALLBACK="${ARJUN_FALLBACK:-0}"    # 1 = usa crawl_targets se o probe não
 PORTS_MODE="${PORTS_MODE:-quick}"        # none | quick (top 100) | full (top 1000)
 NAABU_TOP_PORTS="${NAABU_TOP_PORTS:-1000}"     # usado quando PORTS_MODE=full
 NAABU_EXCLUDE="${NAABU_EXCLUDE:-22,23,3389}"
+NAABU_RATE="${NAABU_RATE:-4000}"          # pacotes/s (2000 não fecha top-1000 em alvo grande)
+NAABU_TIMEOUT="${NAABU_TIMEOUT:-2400}"    # teto da fase; parcial é preservado
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-8}"
 UA="${UA:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36}"
 KATANA_DEPTH="${KATANA_DEPTH:-3}"
@@ -138,6 +148,7 @@ CRAWL_EXCLUDE="${CRAWL_EXCLUDE:-cdn|static|img[0-9]*|images|assets|media|files|d
 GAU_PROVIDERS="${GAU_PROVIDERS:-commoncrawl,urlscan}"
 GAU_FORCE="${GAU_FORCE:-0}"               # 1 = roda gau mesmo com commoncrawl bloqueado
 URLSCAN_PAGES="${URLSCAN_PAGES:-3}"       # páginas do fallback urlscan (100/página)
+URLSCAN_FALLBACK_PAGES="${URLSCAN_FALLBACK_PAGES:-10}"  # quando wayback/gau estão bloqueados
 HISTORY_PROXY_ENV="${HISTORY_PROXY-}"
 HISTORY_PROXY="${HISTORY_PROXY:-auto}"    # auto (detecta Tor 9050/9150) | off | socks5h://host:porta
 CDX_LIMIT="${CDX_LIMIT:-20000}"           # teto de URLs do CDX
@@ -188,7 +199,7 @@ ARGUMENTOS
 OPÇÕES
   --threads N           paralelismo por alvo (default: ${THREADS})
   --fresh               apaga o diretório de saída antes de rodar
-  --force               ignora o scope gate (confirme autorização)
+  --force               silencia o aviso de escopo (o alvo roda de qualquer forma)
   --plan                valida/normaliza/deduplica alvos e mostra o plano (sem requests)
   --check-keys          testa token GitHub e key do chaos (sem recon) e sai
   --file F              lê alvos de F (1 por linha, # comentário, wildcard ok)
@@ -221,16 +232,18 @@ MULTI-TARGET
 
 MENU [7] OPÇÕES
   Controla tudo: perfil DEEP (liga/desliga), threads, skip-brute, ports mode,
-  katana hosts/depth/chunk/p/mdp/RAM, skip-history, skip-arjun, skip-chaos, fresh, force.
+  katana hosts/depth/chunk/p/mdp/RAM, skip-history, skip-arjun, skip-chaos, fresh,
+  silenciar aviso de escopo.
   A linha de status abaixo da lista mostra o perfil ativo antes de rodar.
 
 ENV
   THREADS MAX_PERMUTATIONS MAX_JS MAX_ARJUN NAABU_TOP_PORTS NAABU_EXCLUDE
   KATANA_DEPTH KATANA_FS KATANA_HEADLESS AUTH_FILE GH_TOKEN_FILE DB_PATH DOCS_ROOT
-  TARGETS_FILE BANNER_FILE CHAOS_KEY_FILE SKIP_CHAOS
+  TARGETS_FILE BANNER_FILE CHAOS_KEY_FILE SKIP_CHAOS BANNERS_DIR BANNER_EACH
   SUBFINDER_ALL SUBFINDER_RECURSIVE SUBFINDER_MAX_TIME SUBFINDER_TIMEOUT
   PORTS_MODE KATANA_CHUNK KATANA_MAX_HOSTS KATANA_DEPTH KATANA_JSLUICE
   KATANA_AFF KATANA_FSU KATANA_CHUNK_TIMEOUT KATANA_MAX_URLS_PER_CHUNK
+  NAABU_RATE NAABU_TIMEOUT URLSCAN_FALLBACK_PAGES
   KATANA_PARALLEL KATANA_MAX_PAGES KATANA_CRAWL_TIME KATANA_MAX_RESPONSE
   KATANA_FST KATANA_IQP KATANA_MEM_LIMIT_MB KATANA_RETRY_SPLIT KATANA_SAFE_TIMEOUT
   HISTORY_PER_HOST MAX_JS MAX_ARJUN CRAWL_EXCLUDE GAU_PROVIDERS
@@ -254,11 +267,36 @@ warn() { _logfile "! $*"; printf '%s[%s] !%s %s\n' "$C_WARN" "$(date +%H:%M:%S)"
 die()  { _logfile "x $*"; printf '%s[%s] x%s %s\n' "$C_ERR" "$(date +%H:%M:%S)" "$C_RST" "$*" >&2; exit 1; }
 
 # Banner (ASCII em branco). Fica em arquivo separado para trocar sem editar código.
+# Coleção: todos os .txt em BANNERS_DIR, em ordem alfabética, rotacionando um por
+# render do menu. Sem BANNERS_DIR, usa BANNER_FILE (legado).
+BANNERS=()
+BANNER_IDX=0
+
+banner_scan() {
+  local f
+  BANNERS=()
+  if [[ -d "$BANNERS_DIR" ]]; then
+    while IFS= read -r f; do
+      [[ -s "$f" ]] && BANNERS+=("$f")
+    done < <(find "$BANNERS_DIR" -maxdepth 1 -type f -name '*.txt' -print 2>/dev/null | LC_ALL=C sort)
+  fi
+  if (( ${#BANNERS[@]} == 0 )) && [[ -s "$BANNER_FILE" ]]; then
+    BANNERS=("$BANNER_FILE")
+  fi
+  return 0
+}
+
 print_banner() {
   [[ -t 1 ]] || return 0
+  (( ${#BANNERS[@]} )) || banner_scan
+  local f=""
+  if (( ${#BANNERS[@]} )); then
+    f="${BANNERS[$(( BANNER_IDX % ${#BANNERS[@]} ))]}"
+    BANNER_IDX=$(( BANNER_IDX + 1 ))
+  fi
   printf '%s' "${UI_TXT:-$'\033[97m'}"
-  if [[ -r "$BANNER_FILE" ]]; then
-    cat "$BANNER_FILE"
+  if [[ -n "$f" && -r "$f" ]]; then
+    cat "$f"
   else
     printf '  recon_high_end v%s\n' "$VERSION"
   fi
@@ -268,6 +306,25 @@ print_banner() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 count() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+
+# Estimativa grosseira da fase de crawl (usada no pré-voo). Não é promessa:
+# alvo grande com -mdp alto pode passar disso.
+run_estimate() {
+  local cap="${KATANA_MAX_HOSTS:-0}" chunks per sec
+  if (( cap == 0 )); then
+    printf 'todos os hosts: 2-6 h+ (depende do crawl)'
+    return 0
+  fi
+  chunks=$(( (cap + KATANA_CHUNK - 1) / KATANA_CHUNK ))
+  per=150
+  (( KATANA_JSLUICE || KATANA_AFF )) && per=240
+  sec=$(( chunks * per ))
+  if (( sec >= 3600 )); then
+    printf '~%dh%02d' $((sec / 3600)) $(((sec % 3600) / 60))
+  else
+    printf '~%dmin' $((sec / 60))
+  fi
+}
 
 # Preserva artefatos de execuções anteriores (ex: git pull do GH Actions)
 backup_existing() {
@@ -363,11 +420,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Ctrl-C / SIGTERM: encerra filhos e libera o lock de forma limpa
+# Ctrl-C / SIGTERM: encerra a árvore de filhos (netos inclusive) e sai limpo
+kill_descendants() {
+  local p="$1" k
+  for k in $(pgrep -P "$p" 2>/dev/null || true); do
+    kill_descendants "$k"
+    kill -TERM "$k" 2>/dev/null || true
+  done
+}
 interrupted() {
   warn "interrompido (Ctrl-C/SIGTERM) — encerrando"
   trap - INT TERM
-  pkill -TERM -P $$ 2>/dev/null || true
+  if have pgrep; then
+    kill_descendants $$
+  else
+    pkill -TERM -P $$ 2>/dev/null || true
+  fi
   exit 130
 }
 trap interrupted INT TERM
@@ -485,8 +553,9 @@ export -f dl_js js_base_url js_urls js_map_sources arjun_one
 # ── Credenciais opcionais (GitHub / Chaos) ───────────────────────────────────
 GH_ENABLED=1
 CHAOS_ENABLED=1
-GH_TOKEN_CACHE=""
-CHAOS_KEY_CACHE=""
+# sentinela: força a validação na primeira chamada mesmo sem token/key
+GH_TOKEN_CACHE="__init__"
+CHAOS_KEY_CACHE="__init__"
 
 github_token_value() {
   local t="${GITHUB_TOKEN:-}"
@@ -494,6 +563,45 @@ github_token_value() {
     t="$(head -n1 "$GH_TOKEN_FILE" 2>/dev/null | tr -d '\r\n ')"
   fi
   printf '%s' "$t"
+}
+
+# Fonte github-subdomains para um domínio.
+# O binário grava os achados SOMENTE no arquivo (-o); o stdout é só status/erro.
+# Domínio que é sufixo público (ex.: gov.sg, que está na PSL) não tem eTLD+1 e o
+# binário aborta com "cannot derive eTLD+1" — a fonte simplesmente não se aplica.
+github_subdomains_source() {
+  local d="$1" passive="$2" ghtoken tmp out rc before after
+  have github-subdomains && (( GH_ENABLED )) || return 0
+  ghtoken="$(github_token_value)"
+  [[ -n "$ghtoken" ]] || { log "github-subdomains: sem token — pulando"; return 0; }
+
+  mkdir -p /tmp/opencode 2>/dev/null || true
+  tmp="$(mktemp /tmp/opencode/ghsub-XXXXXX 2>/dev/null)" || return 0
+  out="${tmp}.out"
+  before="$(count "$passive")"
+  log "github-subdomains: consultando (pode levar alguns minutos)"
+  rc=0
+  # token via env: não aparece no argv do processo
+  GITHUB_TOKEN="$ghtoken" timeout 300 github-subdomains -d "$d" -o "$tmp" \
+    > "$out" 2>>"${LOG:-/dev/null}" || rc=$?
+
+  # importa só linhas que são hostname (evita lixo de status no passive.txt)
+  { cat "$tmp" 2>/dev/null; cat "$out" 2>/dev/null; } \
+    | grep -Eai '^([a-z0-9_*]+\.)+[a-z]{2,63}$' >> "$passive" 2>/dev/null || true
+
+  if (( rc != 0 )); then
+    if grep -qi 'cannot derive eTLD+1' "$out" 2>/dev/null; then
+      log "github-subdomains: ${d} é sufixo público (PSL) — fonte não se aplica"
+    elif (( rc == 124 )); then
+      warn "github-subdomains: timeout (300s) — resultado parcial"
+    else
+      warn "github-subdomains: falhou (rc=${rc}) — detalhe em ${LOG:-log}"
+    fi
+  fi
+  after="$(count "$passive")"
+  log "github-subdomains: $((after - before)) nome(s) adicionado(s) [total ${after}]"
+  rm -f "$tmp" "$out"
+  return 0
 }
 
 # Prioridade: CHAOS_KEY (env) → targets/chaos_key → ~/.config/chaos/config.yaml
@@ -566,7 +674,7 @@ preflight_credentials() {
   k="$(chaos_key_value)"
   if (( SKIP_CHAOS )); then
     CHAOS_ENABLED=0
-    CHAOS_KEY_CACHE=""   # religar o toggle força revalidação
+    CHAOS_KEY_CACHE="__init__"   # religar o toggle força revalidação
   elif [[ "$k" != "$CHAOS_KEY_CACHE" ]]; then
     CHAOS_KEY_CACHE="$k"
     c="$(chaos_check)"
@@ -582,10 +690,9 @@ preflight_credentials() {
 }
 
 check_keys() {
-  local gc cc k
+  local gc cc
   gc="$(gh_check)"
   cc="$(chaos_check)"
-  k="$(chaos_key_value)"
   if [[ "$gc" == "200" ]]; then
     printf 'github-subdomains : OK (%s)\n' "$GH_TOKEN_FILE"
   elif [[ "$gc" == "none" ]]; then
@@ -648,19 +755,7 @@ phase_asset() {
   fi
 
   if have github-subdomains && (( GH_ENABLED )); then
-    local ghtoken gh_before gh_after
-    ghtoken="$(github_token_value)"
-    if [[ -n "$ghtoken" ]]; then
-      gh_before="$(count "$passive")"
-      log "github-subdomains: consultando (pode levar alguns minutos)"
-      # token via env: não aparece no argv do processo
-      GITHUB_TOKEN="$ghtoken" timeout 300 github-subdomains -d "$d" 2>>"$LOG" >> "$passive" \
-        || warn "github-subdomains falhou (token escopos/rate limit?)"
-      gh_after="$(count "$passive")"
-      log "github-subdomains: $((gh_after - gh_before)) nome(s) adicionado(s) [total ${gh_after}]"
-    else
-      log "github-subdomains: sem token — pulando"
-    fi
+    github_subdomains_source "$d" "$passive"
   fi
 
   # subfinder por último: é a fonte mais lenta, com teto de tempo
@@ -793,13 +888,23 @@ phase_ports_http() {
     log "portas: pulado (mode=${PORTS_MODE})"
     : > "$OUT/open_ports.txt"
   elif have naabu; then
-    local tp=100
+    local tp=100 hosts est nrc=0
     [[ "$PORTS_MODE" == "full" ]] && tp="$NAABU_TOP_PORTS"
-    log "portas: top-${tp} (mode=${PORTS_MODE}, -ec, excl ${NAABU_EXCLUDE})"
+    hosts="$(count "$OUT/subdomains.txt")"
+    est=$(( hosts * tp / (NAABU_RATE > 0 ? NAABU_RATE : 1) ))
+    log "portas: top-${tp} (mode=${PORTS_MODE}, -ec, excl ${NAABU_EXCLUDE}, rate ${NAABU_RATE}/s, ${hosts} hosts, ~$((est / 60))m)"
     : > "$OUT/open_ports_raw.txt"
-    timeout 1200 naabu -list "$OUT/subdomains.txt" -top-ports "$tp" \
-      -ep "$NAABU_EXCLUDE" -ec -silent -rate 2000 2>>"$LOG" \
-      | tee "$OUT/open_ports_raw.txt" | sort -u > "$OUT/open_ports.txt" || warn "naabu falhou"
+    set +e
+    timeout "$NAABU_TIMEOUT" naabu -list "$OUT/subdomains.txt" -top-ports "$tp" \
+      -ep "$NAABU_EXCLUDE" -ec -silent -rate "$NAABU_RATE" 2>>"$LOG" \
+      | tee "$OUT/open_ports_raw.txt" | sort -u > "$OUT/open_ports.txt"
+    nrc=${PIPESTATUS[0]}
+    set -e
+    if (( nrc == 124 )); then
+      warn "naabu: timeout de ${NAABU_TIMEOUT}s — seguindo com o resultado parcial ($(count "$OUT/open_ports.txt") portas); aumente NAABU_TIMEOUT ou NAABU_RATE"
+    elif (( nrc != 0 )); then
+      warn "naabu falhou (rc=${nrc}) — seguindo com o resultado parcial ($(count "$OUT/open_ports.txt") portas)"
+    fi
   else
     warn "naabu ausente"
   fi
@@ -888,7 +993,7 @@ wayback_cdx() {
   local d="$1" out="$2" proxy pargs=()
   proxy="$(history_proxy_url || true)"
   [[ -n "$proxy" ]] && pargs=(--proxy "$proxy")
-  curl "${pargs[@]+"${pargs[@]}"}" -s -m 600 \
+  curl "${pargs[@]+"${pargs[@]}"}" -s -m 600 --connect-timeout 20 \
     "https://web.archive.org/cdx/search/cdx?url=*.${d}&fl=original&collapse=urlkey&limit=${CDX_LIMIT}" \
     > "$out" 2>>"$LOG" || true
   if grep -qE '^https?://' "$out" 2>/dev/null; then
@@ -1026,7 +1131,12 @@ phase_content() {
         fi
       fi
       # fallback: urlscan API (web.archive/commoncrawl bloqueados nesta rede)
-      urlscan_history "$DOMAIN" "$OUT/urls_urlscan.txt"
+      local us_pages="${URLSCAN_PAGES:-3}"
+      if [[ ! -s "$OUT/urls_wayback.txt" && ! -s "$OUT/urls_gau.txt" ]]; then
+        us_pages="${URLSCAN_FALLBACK_PAGES:-10}"
+        log "urlscan: wayback/gau bloqueados — ampliando para ${us_pages} páginas"
+      fi
+      urlscan_history "$DOMAIN" "$OUT/urls_urlscan.txt" "$us_pages"
       log "urlscan: $(count "$OUT/urls_urlscan.txt") URLs"
     fi
   fi
@@ -1051,6 +1161,14 @@ phase_content() {
     local heavy=()
     (( KATANA_AFF )) && heavy+=(-aff)
     (( KATANA_JSLUICE )) && heavy+=(-jsl)
+    # modo médio: mesmo chunk/depth/mdp, mas sem -jsl/-aff (mantém a cobertura)
+    local mid=(-d "$KATANA_DEPTH" -jc -xhr -kf all -fs "$KATANA_FS"
+               -rl 120 -c 5 -timeout "$HTTP_TIMEOUT" -silent -duc
+               -p 1 -mrs 1048576 -fst "$KATANA_FST")
+    (( KATANA_MAX_PAGES > 0 )) && mid+=(-mdp "$KATANA_MAX_PAGES")
+    (( KATANA_CRAWL_TIME > 0 )) && mid+=(-ct "${KATANA_CRAWL_TIME}s")
+    (( KATANA_IQP )) && mid+=(-iqp)
+    (( KATANA_FSU )) && mid+=(-fsu)
     # modo leve: fallback host a host quando um chunk estoura a RAM
     local safe=(-d 2 -jc -xhr -kf all -fs "$KATANA_FS"
                 -rl 60 -c 5 -timeout "$HTTP_TIMEOUT" -silent -duc
@@ -1062,6 +1180,9 @@ phase_content() {
     local total_chunks
     total_chunks="$(find "$chunk_dir" -name 'part_*' | wc -l | tr -d ' ')"
     log "katana: $(count "$crawl_list") alvos em ${total_chunks} chunk(s) de ${KATANA_CHUNK} (depth ${KATANA_DEPTH}, p=${KATANA_PARALLEL}, mdp=$( (( KATANA_MAX_PAGES > 0 )) && echo "$KATANA_MAX_PAGES" || echo off ), jsl=$([[ $KATANA_JSLUICE -eq 1 ]] && echo on || echo off), aff=$([[ $KATANA_AFF -eq 1 ]] && echo on || echo off))"
+    if (( KATANA_JSLUICE || KATANA_AFF )); then
+      log "katana: -jsl/-aff ligados (RAM alta) — chunk que estourar é re-tentado sem eles, mantendo depth/mdp"
+    fi
     if katana_mem_setup; then
       log "katana: teto de RAM ${KATANA_MEM_LIMIT_MB}MB por chunk (cgroup v2)"
     else
@@ -1084,6 +1205,13 @@ phase_content() {
       # stderr da chamada vai pro log (inclui o aviso "Killed" do próprio bash)
       katana_crawl "$f" "$OUT/urls_katana.txt" "$KATANA_CHUNK_TIMEOUT" \
         "${base[@]}" "${heavy[@]+"${heavy[@]}"}" "${HDR_FLAGS[@]+"${HDR_FLAGS[@]}"}" 2>>"$LOG" || rc=$?
+      if (( rc == 137 && ${#heavy[@]} > 0 )); then
+        # estourou com -jsl/-aff: repete o chunk completo sem eles, mantendo depth/mdp
+        warn "katana: chunk ${i}/${total_chunks} estourou com -jsl/-aff — re-tentando o chunk sem eles (depth/mdp preservados)"
+        rc=0
+        katana_crawl "$f" "$OUT/urls_katana.txt" "$KATANA_CHUNK_TIMEOUT" \
+          "${mid[@]}" "${HDR_FLAGS[@]+"${HDR_FLAGS[@]}"}" 2>>"$LOG" || rc=$?
+      fi
       if (( rc == 137 && KATANA_RETRY_SPLIT )); then
         local one="$chunk_dir/one.txt" host
         warn "katana: chunk ${i}/${total_chunks} estourou a RAM — re-tentando host a host (modo leve)"
@@ -1147,9 +1275,10 @@ phase_js() {
     xargs -r -P "$THREADS" -I{} bash -c 'dl_js "$1"' _ {} < "$OUT/js_files.txt" \
       || warn "download JS parcial"
   fi
-  local attempted
+  local attempted downloaded
   attempted="$(count "$OUT/js_files.txt")"
   downloaded="$(find "$JS_DIR" -maxdepth 1 -type f -name '*.js' 2>/dev/null | wc -l | tr -d ' ')"
+  downloaded="${downloaded:-0}"
   log "js: ${downloaded}/${attempted} arquivo(s) baixado(s) (resto: 403/404/bloqueio)"
   if [[ -s "$JS_DIR/.failed.tsv" ]]; then
     log "js: falhas por status: $(cut -f1 "$JS_DIR/.failed.tsv" 2>/dev/null | sort | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}')"
@@ -1186,6 +1315,7 @@ phase_js() {
       jq -r 'select(.url != null) | .url' "$OUT/js_endpoints.jsonl" 2>/dev/null \
         | awk 'NF && $0 != "EXPR"' | sort -u > "$OUT/js_endpoints.txt" || true
       downloaded="$(find "$JS_DIR" -maxdepth 1 -type f -name '*.js' 2>/dev/null | wc -l | tr -d ' ')"
+      downloaded="${downloaded:-0}"
       log "js: após 2ª rodada, ${downloaded} arquivo(s) e $(count "$OUT/js_endpoints.txt") rotas"
     fi
   fi
@@ -1292,6 +1422,7 @@ phase_params() {
     | sort -u > "$OUT/params_all.txt" || true
 
   : > "$OUT/arjun_params.txt"
+  : > "$OUT/arjun_targets.txt"   # evita alvos velhos de uma run anterior
   if (( SKIP_ARJUN )); then
     log "arjun: pulado (--skip-arjun)"
   elif have arjun; then
@@ -1527,12 +1658,15 @@ load_targets_file() {
     warn "lista não encontrada ou vazia: ${f}"
     return 1
   fi
+  local toks=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     [[ -z "${line//[[:space:]]/}" ]] && continue
     line="${line//,/ }"
-    for tok in $line; do
+    # read -a: separa sem expansão de glob (um token "*" não vira arquivo)
+    read -r -a toks <<< "$line" || true
+    for tok in "${toks[@]+"${toks[@]}"}"; do
       if ! norm="$(normalize_target "$tok")"; then
         warn "alvo inválido ignorado em ${f}: '${tok}'"
         continue
@@ -1575,13 +1709,42 @@ dedupe_targets() {
   return 0
 }
 
+# Entradas do scope.md parseadas uma vez (cache por mtime:tamanho). Aceita
+# domínio raiz, wildcard, URL, markdown e comentário; extrai o 1º token de domínio.
+SCOPE_ENTRIES=()
+SCOPE_SIG=""
+scope_load() {
+  local sig line
+  [[ -f "$SCOPE_FILE" ]] || { SCOPE_ENTRIES=(); SCOPE_SIG=""; return 0; }
+  sig="$(stat -c '%Y:%s' "$SCOPE_FILE" 2>/dev/null || true)"
+  [[ -n "$sig" && "$sig" == "$SCOPE_SIG" ]] && return 0
+  SCOPE_SIG="$sig"
+  SCOPE_ENTRIES=()
+  while IFS= read -r line; do
+    line="${line,,}"
+    line="${line%%#*}"                      # comentário
+    line="${line##*://}"                    # URL
+    line="${line%%/*}"
+    [[ "$line" =~ ([a-z0-9][a-z0-9._-]*\.[a-z]{2,}) ]] || continue
+    line="${BASH_REMATCH[1]}"
+    line="${line#www.}"
+    line="${line%.}"
+    SCOPE_ENTRIES+=("$line")
+  done < "$SCOPE_FILE"
+  return 0
+}
+
+# O escopo é AVISO, não bloqueio: alvo fora do scope.md roda de qualquer forma,
+# com warning (silenciável por --force). A comparação é por rótulo de domínio —
+# "example.com" NÃO casa com "evil-example.com" (o grep -F antigo casava).
 scope_check_target() {
-  local t="$1" root
+  local t="${1,,}" e
   [[ -f "$SCOPE_FILE" ]] || return 0
-  root="$t"
-  [[ "$t" == *.*.* ]] && root="${t#*.}"
-  grep -qiF -- "$t" "$SCOPE_FILE" && return 0
-  grep -qiF -- "$root" "$SCOPE_FILE" && return 0
+  scope_load
+  for e in "${SCOPE_ENTRIES[@]+"${SCOPE_ENTRIES[@]}"}"; do
+    [[ "$t" == "$e" ]] && return 0
+    [[ "$t" == *".${e}" ]] && return 0
+  done
   return 1
 }
 scope_check() { scope_check_target "$TARGET"; }
@@ -1603,26 +1766,27 @@ print_plan() {
     i=$((i + 1))
     if scope_check_target "$t"; then
       st="ok"
-    elif (( FORCE )); then
-      st="force"
     else
-      st="FORA"
+      st="aviso"
     fi
     printf '  %-3d %-48s %-8s %s\n' "$i" "$t" "$st" "${DOCS_ROOT}/${t}"
   done
-  printf '\nNenhum request foi feito (--plan).\n\n'
+  printf '\nFora do %s = aviso, não bloqueio (use --force para silenciar).\n' "${SCOPE_FILE##*/}"
+  printf 'Nenhum request foi feito (--plan).\n\n'
   return 0
 }
 
 # Aceita "1 3 4-6" ou vazio (= todos). Preenche SELECTED.
 parse_selection() {
-  local input="${1//,/ }" part a b i t dup
+  local input="${1//,/ }" part a b i t dup sel
+  local parts=()
   SELECTED=()
   if [[ -z "${input//[[:space:]]/}" ]]; then
     SELECTED=("${TARGETS[@]+"${TARGETS[@]}"}")
     return 0
   fi
-  for part in $input; do
+  read -r -a parts <<< "$input" || true
+  for part in "${parts[@]+"${parts[@]}"}"; do
     if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
       (( a > b )) && { t=$a; a=$b; b=$t; }
@@ -1630,7 +1794,7 @@ parse_selection() {
         if (( i >= 1 && i <= ${#TARGETS[@]} )); then
           t="${TARGETS[$((i - 1))]}"
           dup=0
-          for part in "${SELECTED[@]+"${SELECTED[@]}"}"; do [[ "$part" == "$t" ]] && dup=1; done
+          for sel in "${SELECTED[@]+"${SELECTED[@]}"}"; do [[ "$sel" == "$t" ]] && dup=1; done
           (( dup )) || SELECTED+=("$t")
         fi
       done
@@ -1638,7 +1802,7 @@ parse_selection() {
       if (( part >= 1 && part <= ${#TARGETS[@]} )); then
         t="${TARGETS[$((part - 1))]}"
         dup=0
-        for a in "${SELECTED[@]+"${SELECTED[@]}"}"; do [[ "$a" == "$t" ]] && dup=1; done
+        for sel in "${SELECTED[@]+"${SELECTED[@]}"}"; do [[ "$sel" == "$t" ]] && dup=1; done
         (( dup )) || SELECTED+=("$t")
       else
         warn "índice fora da lista: ${part}"
@@ -1804,7 +1968,7 @@ ui_targets_table() {
   else
     for i in "${!TARGETS[@]}"; do
       t="${TARGETS[$i]}"
-      if scope_check_target "$t"; then sc="ok"; col="$UI_TXT"; else sc="FORA"; col="$UI_ACC"; fi
+      if scope_check_target "$t"; then sc="ok"; col="$UI_TXT"; else sc="aviso"; col="$UI_ACC"; fi
       [[ -d "${DOCS_ROOT}/${t}" ]] && st="existe" || st="novo"
       last="—"
       if [[ -f "${DOCS_ROOT}/${t}/SUMMARY.md" ]]; then
@@ -1829,10 +1993,13 @@ ui_actions() {
 
 ui_footer() {
   [[ -t 1 ]] || return 0
-  printf ' %sperfil:%s %s · ports %s · katana %s · chunk %s · jsl %s · aff %s · escopo %s · brute %s\n' \
+  printf ' %sperfil:%s %s · ports %s · katana %s · chunk %s · p %s · mdp %s · ram %s · jsl %s · aff %s · escopo %s · brute %s\n' \
     "$UI_HDR" "$UI_RST" "$PROFILE_LABEL" "$PORTS_MODE" \
     "$([[ "$KATANA_MAX_HOSTS" == "0" ]] && echo all || echo "$KATANA_MAX_HOSTS")" \
-    "$KATANA_CHUNK" "$(onoff "$KATANA_JSLUICE")" "$(onoff "$KATANA_AFF")" "$KATANA_FS" \
+    "$KATANA_CHUNK" "$KATANA_PARALLEL" \
+    "$([[ "$KATANA_MAX_PAGES" == "0" ]] && echo off || echo "$KATANA_MAX_PAGES")" \
+    "$( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off )" \
+    "$(onoff "$KATANA_JSLUICE")" "$(onoff "$KATANA_AFF")" "$KATANA_FS" \
     "$([[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on)"
   printf ' %satalhos:%s a add · i import · x remover · r rodar · s seleção · o opções · p pastas · t tema · q sair\n' \
     "$UI_DIM" "$UI_RST"
@@ -1877,6 +2044,7 @@ mark_custom() { DEEP=0; PROFILE_LABEL="custom"; }
 settings_menu() {
   local opt val
   while true; do
+    [[ "${BANNER_EACH:-1}" == "1" ]] && print_banner
     printf '\n  %s† OPÇÕES%s\n' "$UI_HDR" "$UI_RST"
     printf '   1) threads ............ %s\n' "$THREADS"
     printf '   2) perfil DEEP ........ %s\n' "$(onoff "$DEEP")"
@@ -1889,7 +2057,7 @@ settings_menu() {
     printf '   9) skip-arjun ......... %s\n' "$(onoff "$SKIP_ARJUN")"
     printf '  10) skip-chaos ......... %s\n' "$(onoff "$SKIP_CHAOS")"
     printf '  11) fresh .............. %s\n' "$(onoff "$FRESH")"
-    printf '  12) force (scope) ...... %s\n' "$(onoff "$FORCE")"
+    printf '  12) aviso de escopo .... %s\n' "$( (( FORCE )) && echo 'silenciado' || echo 'on' )"
     printf '  13) tema ............... %s\n' "$THEME"
     printf '  14) katana jsl ......... %s\n' "$(onoff "$KATANA_JSLUICE")"
     printf '  15) katana aff ......... %s\n' "$(onoff "$KATANA_AFF")"
@@ -1961,7 +2129,7 @@ paths_menu() {
       if scope_check_target "$t"; then
         printf '   %-3d %-34s %-8s %-6s %s\n' "$((i + 1))" "$t" "$st" "ok" "$full"
       else
-        printf '   %-3d %-34s %-8s %-6s %s\n' "$((i + 1))" "$t" "$st" "FORA" "$full"
+        printf '   %-3d %-34s %-8s %-6s %s\n' "$((i + 1))" "$t" "$st" "aviso" "$full"
       fi
     done
   else
@@ -1981,8 +2149,9 @@ paths_menu() {
 }
 
 menu() {
-  local opt line tok
+  local opt line tok menu_toks=()
   while true; do
+    [[ "${BANNER_EACH:-1}" == "1" ]] && print_banner
     printf '\n'
     ui_header
     ui_targets_table
@@ -1996,7 +2165,8 @@ menu() {
       1|a|A)
         read -rp "  targets (espaço/vírgula, aceita *.dominio): " line || continue
         line="${line//,/ }"
-        for tok in $line; do add_target "$tok" || true; done
+        read -r -a menu_toks <<< "$line" || true
+        for tok in "${menu_toks[@]+"${menu_toks[@]}"}"; do add_target "$tok" || true; done
         save_targets_file
         ;;
       2|i|I)
@@ -2057,13 +2227,11 @@ run_one_target() {
   ARJUN_DIR="${OUT}/arjun"
 
   if ! scope_check; then
+    # aviso, não bloqueio: o alvo roda de qualquer forma
     if (( FORCE )); then
-      warn "${TARGET} fora do scope.md — seguindo por --force"
+      log "${TARGET} fora do ${SCOPE_FILE##*/} — aviso silenciado (--force)"
     else
-      warn "${TARGET} fora do scope.md — pulando (use --force se autorizado)"
-      db_log batch "$TARGET" skipped "" "out-of-scope" 0
-      BATCH_ROWS+=("${TARGET}|skip|0|0|0|0|0")
-      return 3
+      warn "${TARGET} fora do ${SCOPE_FILE##*/} — seguindo mesmo assim (só aviso; registre em ${SCOPE_FILE})"
     fi
   fi
 
@@ -2096,15 +2264,18 @@ run_one_target() {
   PHASE_N=0
 
   if [[ -t 1 ]]; then
+    local plabel="$PROFILE_LABEL"
+    (( DEEP )) && plabel+=" (deep)"
+    [[ "$PROFILE_LABEL" == custom ]] || (( DEEP )) || plabel+=" (rápido)"
     ui_card "PRÉ-VOO · ${TARGET}" \
-      "perfil    ${PROFILE_LABEL}$( [[ $DEEP -eq 1 ]] && echo ' (deep)' || echo ' (rápido)' )" \
+      "perfil    ${plabel}" \
       "ports     ${PORTS_MODE} · katana $( [[ "$KATANA_MAX_HOSTS" == "0" ]] && echo todos || echo "${KATANA_MAX_HOSTS} hosts" ) · depth ${KATANA_DEPTH}" \
       "katana    chunk ${KATANA_CHUNK} · jsl $(onoff "$KATANA_JSLUICE") · aff $(onoff "$KATANA_AFF") · escopo ${KATANA_FS}" \
       "katana    p ${KATANA_PARALLEL} · mdp $( (( KATANA_MAX_PAGES > 0 )) && echo "${KATANA_MAX_PAGES} págs/dom" || echo ilimitado ) · RAM/chunk $( (( KATANA_MEM_LIMIT_MB > 0 )) && echo "${KATANA_MEM_LIMIT_MB}MB" || echo off )" \
-      "escopo    ok · bruteforce $( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on )" \
+      "escopo    $( scope_check && echo 'ok' || echo "aviso: fora do ${SCOPE_FILE##*/}" ) · bruteforce $( [[ $SKIP_BRUTE -eq 1 ]] && echo off || echo on )" \
       "saída     ${OUT}" \
       "parar     Ctrl-C ou kill -TERM $$" \
-      "estimado  $( [[ $DEEP -eq 1 ]] && echo '1.5-2.5 h' || echo '30-45 min (alvo grande)' )"
+      "estimado  $(run_estimate)"
   fi
 
   # variáveis usadas pelos filhos de xargs -P
@@ -2147,7 +2318,7 @@ write_batch_summary() {
   {
     printf '# Batch recon — %s\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf -- '- Alvos: %d | ok: %d | falha: %d | pulados: %d\n' "$((ok + fail + skip))" "$ok" "$fail" "$skip"
-    printf -- '- Threads: %s | fresh: %s | force: %s\n\n' "$THREADS" "$(onoff "$FRESH")" "$(onoff "$FORCE")"
+    printf -- '- Threads: %s | fresh: %s | force (silencia aviso de escopo): %s\n\n' "$THREADS" "$(onoff "$FRESH")" "$(onoff "$FORCE")"
     printf '| target | status | subs | live | endpoints | high-value | secrets |\n'
     printf '|---|---|---|---|---|---|---|\n'
     for row in "${BATCH_ROWS[@]+"${BATCH_ROWS[@]}"}"; do
@@ -2187,6 +2358,10 @@ run_batch() {
     fi
   done
   list=("${deduped[@]+"${deduped[@]}"}")
+  if (( ${#list[@]} == 0 )); then
+    warn "todos os alvos foram deduplicados — nada a rodar"
+    return 1
+  fi
 
   db_init
   load_auth
@@ -2227,7 +2402,7 @@ run_batch() {
   fi
   log "artefatos: ${DOCS_ROOT}/<target>/  (por alvo)"
   if (( skip > 0 )); then
-    log "dica: ${skip} alvo(s) fora do scope — edite ${SCOPE_FILE} ou ative force=on em [7]"
+    log "dica: ${skip} alvo(s) pulado(s) — lock ativo de outra run ou falha ao preparar a saída"
   fi
   local bstatus="ok"
   (( fail > 0 )) && bstatus="partial"
@@ -2286,6 +2461,10 @@ main() {
   [[ "$KATANA_MAX_RESPONSE" =~ ^[0-9]+$ ]] || die "KATANA_MAX_RESPONSE inválido"
   [[ "$KATANA_FST" =~ ^[0-9]+$ ]] || die "KATANA_FST inválido"
   [[ "$KATANA_CRAWL_TIME" =~ ^[0-9]+$ ]] || die "KATANA_CRAWL_TIME inválido (segundos; 0 = sem teto)"
+  [[ "$KATANA_CHUNK" =~ ^[0-9]+$ ]] && (( KATANA_CHUNK > 0 )) || die "KATANA_CHUNK inválido (> 0)"
+  [[ "$KATANA_DEPTH" =~ ^[0-9]+$ ]] && (( KATANA_DEPTH >= 1 )) || die "KATANA_DEPTH inválido (>= 1)"
+  [[ "$KATANA_MAX_URLS_PER_CHUNK" =~ ^[0-9]+$ ]] && (( KATANA_MAX_URLS_PER_CHUNK > 0 )) \
+    || die "KATANA_MAX_URLS_PER_CHUNK inválido (> 0)"
 
   ui_load_conf
   ui_theme_set
@@ -2294,9 +2473,8 @@ main() {
     log "perfil DEEP: cobertura total (vai demorar)"
   fi
 
-  print_banner
-
   if (( checkonly )); then
+    print_banner
     check_keys
     return 0
   fi
@@ -2314,9 +2492,12 @@ main() {
       menu
       return 0
     fi
+    print_banner
     usage
     exit 2
   fi
+
+  print_banner
 
   for p in "${positional[@]+"${positional[@]}"}"; do add_target "$p" || true; done
   for f in "${files[@]+"${files[@]}"}"; do load_targets_file "$f" || true; done
