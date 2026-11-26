@@ -1,6 +1,6 @@
 # recon_high_end.sh — manual da ferramenta
 
-> Versão documentada: **1.3.0**
+> Versão documentada: **1.7.0**
 > Local: `/home/hack/scripts/recon_high_end.sh`
 > Banner: `/home/hack/scripts/banner.txt`
 
